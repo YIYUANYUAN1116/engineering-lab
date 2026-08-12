@@ -1,13 +1,6 @@
 # Dragonfly 与 URMA：P2P 数据分发与高性能通信基础
 
-> 技术知识分享文档（面向公司内部研发人员）
->
-> 听众假设：可能不了解 Dragonfly、URMA、RDMA 类通信技术。
->
-> 本文重点讲清楚三件事：**是什么、为什么、怎么工作**。
->
-> 本文不写具体接入实现，不展开 UrmaDownloader、Rust module、FFI 设计，不讨论代码修改方案，作为后续 PPT 的内容基础。
->
+> 技术知识分享文档
 ---
 
 
@@ -616,15 +609,61 @@ Dragonfly 的"一个 Piece 完成"有自己的一套完整语义（收到预期�
 
 ---
 
-## 附：如何用本文快速检验理解
+```
+初始化:
 
-读完本文，你应该能回答：
+Memory Register
+        |
+        v
+Buffer Pool
+        |
+        +-------------+
+        |             |
+        v             v
 
-1. **Dragonfly 为什么存在？**
-   因为大规模、多节点、重复的数据分发，传统"每节点回源"会造成源站瓶颈、带宽浪费和冷启动慢；Dragonfly 用 P2P 分片让节点互相共享数据，从而高效分发。
+   TX Slot Pool   RX Slot Pool
 
-2. **URMA 为什么出现？**
-   因为当传输成为瓶颈时，传统 Socket 的内核协议栈、数据拷贝和 CPU 参与限制了下限；URMA 用用户态 + 硬件协同的异步模型，提供高吞吐、低延迟的节点间搬运。
 
-3. **两者为什么可能结合？**
-   因为 Dragonfly 已把"调度（控制面）"与"传输（数据面）"分离，而 URMA 正是一种更高效的数据面底座；二者结合，可形成"Dragonfly 控制面 + URMA 数据面"，在保持丰富分发能力的同时提升节点间传输性能。
+
+运行:
+
+RX Slot
+  |
+  v
+post_recv()
+
+  |
+  v
+
+post_send(Request)
+
+  |
+  v
+
+Parent
+
+  |
+  v
+
+post_send(Data)
+
+  |
+  v
+
+Child RX Slot
+
+  |
+  v
+
+CQE
+
+  |
+  v
+
+处理Piece
+
+  |
+  v
+
+repost_recv()
+```
