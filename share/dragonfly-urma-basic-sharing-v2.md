@@ -281,25 +281,31 @@ Storage
 
 当前 Dragonfly Peer 间普通 Piece 数据可以通过 TCP 或 QUIC 传输。两者都是成熟的可靠传输选择，但实现路径和运行特征不同。
 
-| 维度 | TCP | QUIC |
-|---|---|---|
-| 基本抽象 | 可靠、有序字节流 | 可靠连接上的多路逻辑流 |
-| 协议位置 | 主要由内核协议栈处理 | 主要由用户态 QUIC 实现处理 |
-| 生态与兼容性 | 非常成熟，普遍可用 | 需要 UDP 网络条件与 QUIC 运行库 |
-| 连接演进 | 受内核 TCP 能力约束较多 | 用户态演进和扩展更灵活 |
-| 加密 | 通常额外叠加 TLS | 协议设计中内建安全握手 |
-| Dragonfly 上层看到的结果 | PieceContentStream | PieceContentStream |
+| 维度           | TCP                | QUIC                          |
+| ------------ | ------------------ | ----------------------------- |
+| 传输基础         | TCP                | UDP                           |
+| 可靠传输实现位置     | 内核 TCP 协议栈         | 用户态 QUIC Library              |
+| 数据抽象         | 单条可靠有序字节流          | 一个 Connection 中可包含多个独立 Stream |
+| 丢包影响         | 同一连接内字节流可能因丢包等待重传  | 不同 Stream 之间可减少应用层队头阻塞        |
+| 加密           | 通常 TCP + TLS       | TLS 1.3 集成在 QUIC 中            |
+| 协议演进         | 依赖内核 TCP 能力        | 用户态库升级即可演进                    |
+| 网络要求         | TCP 网络普遍可用         | 要求网络允许 UDP                    |
+| 理论适用场景       | 稳定网络、成熟兼容、大吞吐连接    | 多流并发、连接迁移、快速协议演进              |
+| Dragonfly 上层 | PieceContentStream | PieceContentStream            |
 
 #### 4.1.1 TCP数据路径
 
 ```text
 Application
     |
+    | write()/read()
     v
-Kernel Socket Buffer
-    |
-    v
-Kernel TCP/IP Stack
+Kernel TCP Stack
+- Connection
+- Reliability
+- ACK / Retransmission
+- Congestion Control
+- Ordered Byte Stream
     |
     v
 NIC Driver
@@ -317,8 +323,15 @@ Network
 Application
     |
     v
-QUIC Library
+QUIC Library (User Space)
+- Connection / Stream Management
+- Loss Detection & Recovery
+- Congestion Control
+- TLS 1.3 Handshake / Key Establishment
+- QUIC Packet Protection
     |
+    | sendmsg()/recvmsg()
+    | 
     v
 Kernel UDP/IP Stack
     |
@@ -495,41 +508,75 @@ Context 代表应用针对某个 URMA 设备建立的使用上下文。后续 JF
 
 Jetty 是 URMA 中的通信端点。它组织发送与接收方向的能力，可关联发送功能、接收功能和完成队列。Jetty 可以帮助类比 socket endpoint，但它不是一个透明的字节流：应用仍要显式提交发送或接收工作请求，并通过完成结果管理资源。
 
-### 7.5 JFC：完成队列
+### 7.5 JFS：发送功能队列
+
+JFS（Jetty Function Send）负责承载发送方向的工作请求。应用希望执行 SEND、READ、WRITE 等操作时，会通过 JFS 或 Jetty 的发送侧提交对应 WR。
+
+### 7.6 JFR：接收功能队列
+
+JFR（Jetty Function Receive）负责接收方向的工作请求。对于 SEND/RECV 这种双边通信，接收方需要提前向 JFR 或 Jetty 接收侧提交 RECV WR，为即将到来的数据准备可写入的 Buffer。
+
+### 7.7 JFC：完成队列
 
 JFC（Jetty Function Completion）承载操作完成信息。应用提交 WR 后，提交函数成功通常只表示请求已进入可执行路径，并不表示数据已经传完。设备完成操作后产生硬件完成条目，provider 解析后，应用通过轮询 JFC 获得完成结果。
 
 因此 JFC 是异步模型的“收口点”：发送成功、接收成功、长度、状态和错误最终要从完成结果中确认。
 
-### 7.6 Segment：注册内存区域
+### 7.8 Segment：注册内存区域
 
 Segment 表示经过注册、可以按授权方式被设备访问的内存区域。注册过程建立虚拟地址、长度、权限、标识或 token 与设备可用映射之间的关系。
 
 内存注册的意义是让设备能够安全、明确地执行 DMA，而不必在每个 WR 到来时重新解释一块任意应用内存。相应代价是应用必须管理好生命周期：只要尚未完成的 WR 仍引用某个 Segment 中的 buffer，就不能提前释放、取消注册或无约束复用它。
 
-### 7.7 WR：提交给设备的工作请求
+### 7.9 WR：提交给设备的工作请求
 
 WR（Work Request）描述应用希望设备执行的动作，例如 SEND 或准备 RECV。它通常包含操作类型、数据所在 Segment 的地址与长度、用于完成关联的上下文，以及必要的远端信息。
 
 WR 是“任务描述”，不是数据完成本身。应用可以一次提交一个或一批 WR，设备异步执行；提交之后，应用继续做其他工作或处理别的完成事件。
 
-### 7.8 CQE：硬件完成事件
+### 7.10 CQE：硬件完成事件
 
 CQE（Completion Queue Entry）是设备写入完成队列的底层完成条目。它可以包含状态、操作类型、实际长度和请求关联信息。当前 UMDK provider 会解析 CQE，并通过 liburma 的 JFC 轮询接口向应用返回完成记录。
 
 分享中可以把“CQE”泛化理解为完成事件，但需要记住层次：**硬件产生 CQE，应用通过 poll JFC 获得可消费的完成结果**。
 
-### 7.9 对象关系小结
+### 7.11 URMA 初始化
 
-| 对象 | 回答的问题 | 典型生命周期 |
-|---|---|---|
-| liburma | 应用用什么统一接口访问 URMA | 进程级初始化到退出 |
-| Context | 使用哪个设备、资源归属在哪里 | 一组通信资源的总生命周期 |
-| Jetty | 从哪个端点发送或接收 | 通信关系建立到断开 |
-| JFC | 到哪里获取异步完成结果 | 与关联队列共同存在 |
-| Segment | 设备可以访问哪块内存 | 注册到所有相关 WR 完成 |
-| WR | 这次要设备做什么 | 构造、提交、等待完成 |
-| CQE/完成结果 | 哪个操作完成、结果如何 | 设备产生到应用消费 |
+```text
+Application
+    |
+    v
+urma_init()
+    |
+    v
+发现 / 选择 URMA Device
+    |
+    v
+urma_create_context()
+    |
+    v
+创建通信资源
+    |
+    +--> JFC
+    |
+    +--> Jetty
+    |      |
+    |      +--> JFS
+    |      |
+    |      +--> JFR
+    |
+    +--> Segment
+           |
+           v
+      注册可供设备访问的内存
+    |
+    v
+交换 / 导入远端 Jetty 信息
+    |
+    v
+Bind / 建立通信关系
+
+```
 
 ---
 
@@ -762,3 +809,60 @@ URMA 通常需要设备发现、Context 创建、端点信息交换、远端 Jet
 | WR | 提交给设备执行的工作请求 |
 | CQE | 设备产生的底层完成队列条目 |
 
+## 附录 B： 常用 URMA API
+
+| 类别       | API                         | 作用                         |
+| -------- | --------------------------- | -------------------------- |
+| 初始化      | `urma_init()`               | 初始化 URMA 用户态环境             |
+| 反初始化     | `urma_uninit()`             | 释放 URMA 全局环境               |
+| 设备       | `urma_get_device_by_name()` | 根据设备名获取 URMA Device        |
+| 设备能力     | `urma_query_device()`       | 查询设备能力和资源限制                |
+| Context  | `urma_create_context()`     | 基于指定 Device 创建 Context     |
+| Context  | `urma_delete_context()`     | 删除 Context                 |
+| JFC      | `urma_create_jfc()`         | 创建完成队列                     |
+| JFC      | `urma_delete_jfc()`         | 删除完成队列                     |
+| JFC      | `urma_poll_jfc()`           | 轮询完成结果                     |
+| Jetty    | `urma_create_jetty()`       | 创建双向通信端点                   |
+| Jetty    | `urma_delete_jetty()`       | 删除 Jetty                   |
+| 远端 Jetty | `urma_import_jetty()`       | 导入对端 Jetty 描述信息            |
+| 建链       | `urma_bind_jetty()`         | 将本地 Jetty 与远端 Jetty 建立通信关系 |
+| Segment  | `urma_register_seg()`       | 注册本地内存区域                   |
+| Segment  | `urma_unregister_seg()`     | 注销注册内存                     |
+| SEND     | `urma_post_jetty_send_wr()` | 通过 Jetty 提交发送 WR           |
+| RECV     | `urma_post_jetty_recv_wr()` | 提交接收 WR，提前准备 RX Buffer     |
+
+URMA API 调用链：
+
+```text
+urma_init()
+    |
+    v
+urma_get_device_by_name()
+    |
+    v
+urma_create_context()
+    |
+    +--> urma_create_jfc()
+    |
+    +--> urma_create_jetty()
+    |
+    +--> urma_register_seg()
+    |
+    v
+urma_import_jetty()
+    |
+    v
+urma_bind_jetty()
+    |
+    v
+urma_post_jetty_recv_wr()
+    |
+    v
+urma_post_jetty_send_wr()
+    |
+    v
+urma_poll_jfc()
+    |
+    v
+Completion
+```
