@@ -90,7 +90,6 @@ Parent Peer
 
 ---
 
-
 ## 3. Dragonfly 数据流转
 
 当前 Dragonfly standard Piece 数据路径：
@@ -229,6 +228,7 @@ Context
 
 Provider / Hardware
 ```
+
 | 对象 | 回答的问题 | 典型生命周期 |
 |---|---|---|
 | liburma | 应用通过什么统一接口访问 URMA能力 | 进程级初始化到退出 |
@@ -240,6 +240,7 @@ Provider / Hardware
 | Segment | 设备可以访问哪块注册内存 | 注册成功到注销释放 |
 | WR| 这一次请求设备执行什么操作 | 构造、提交、完成 |
 | CQE/完成结果 | 哪个WR完成、执行结果如何 | 设备产生到应用消费 |
+
 ---
 
 ## 5. URMA 通信
@@ -294,7 +295,9 @@ Bind
 
 Ready
 ```
+
 ### 5.2 URMA 收发时序图
+
 ~~~mermaid
 sequenceDiagram
     participant RApp as 接收方应用
@@ -322,7 +325,7 @@ sequenceDiagram
     RJ-->>RApp: 接收完成结果与实际长度
 ~~~
 
-## 6. 数据路径对比：
+## 6. 数据路径对比
 
 ### 6.1 TCP 数据路径
 
@@ -377,7 +380,8 @@ Application
 ---
 
 ### 6.2 QUIC 数据路径
-```
+
+``` text
 Application
 
     |
@@ -539,13 +543,9 @@ CQE
 | 主要接口   | Socket           | QUIC API                | URMA API             |
 | 完成通知   | read/epoll       | QUIC事件                  | CQE                  |
 
-
 ---
 
-
-
 ## 7. Dragonfly 接入 URMA 涉及的关键适配点
-
 
 ### 7.1. URMA 通信层（Transport）
 
@@ -554,6 +554,7 @@ CQE
 Dragonfly 的 Piece 数据如何通过 URMA 从 Parent 传输到 Child。
 
 当前：
+
 ```
 Downloader
 
@@ -565,8 +566,11 @@ TCP / QUIC
 
 Parent Peer
 ```
+
 接入后：
+
 ```
+
 Downloader
 
     |
@@ -585,6 +589,7 @@ Jetty / SEND / RECV
 
 Parent Peer
 ```
+
 需要处理：
 
 URMA连接建立
@@ -592,15 +597,18 @@ Jetty创建与绑定
 Request/Response消息设计
 Peer间通信管理
 重连和异常处理
-### 7.2. 数据面处理（Data Path）
+
+### 7.2. 数据面处理
 
 解决：
-```
+
+```text
 URMA收到的数据如何转换成 Dragonfly 能消费的数据。
 ```
 
 Dragonfly当前接口：
-```
+
+```text
 Downloader
 
     |
@@ -613,7 +621,8 @@ Storage
 ```
 
 因此 URMA需要实现：
-```
+
+```text
 URMA CQE
 
     |
@@ -631,6 +640,7 @@ PieceContentStream
     |
 
 Storage
+
 ```
 需要处理：
 
@@ -643,7 +653,6 @@ Buffer生命周期
 CQE处理
 数据校验
 
-
 ### 7.3. URMA 生命周期管理（Runtime）
 
 解决：
@@ -651,7 +660,8 @@ CQE处理
 URMA通信资源如何初始化、维护和释放。
 
 包括：
-```
+
+```text
 urma_init
 
     |
@@ -678,6 +688,7 @@ Memory Register
 
 Shutdown
 ```
+
 需要管理：
 
 liburma初始化
@@ -694,11 +705,14 @@ Buffer Pool
 ### 7.4. Scheduler / 控制面适配
 
 解决：
-```
+
+```text
 Scheduler如何知道哪些Peer支持UB/URMA，以及如何选择。
 ```
+
 当前：
-```
+
+```text
 Scheduler
 
     |
@@ -710,8 +724,10 @@ Parent Peer
 TCP Port
 QUIC Port
 ```
+
 未来可能：
-```
+
+```text
 Scheduler
 
     |
@@ -724,6 +740,7 @@ Parent Peer
     + URMA endpoint
     + UB capability
 ```
+
 需要：
 UB节点发现方式
 URMA能力上报
@@ -734,7 +751,8 @@ UB网络拓扑
 延迟
 内存资源
 
-### 7.5 初步方案时序图
+### 7.5 Dragonfly 接入 URMA 数据面初步流程
+
 #### 7.5.1 Child 流程
 
 ```mermaid
@@ -804,17 +822,17 @@ sequenceDiagram
 - [URMA源码确认] post API 的同步返值只反映 WR 是否成功入队；数据面异步结果必须检查 send CQE/`urma_cr_t.status`。
 - [架构推断] Parent send CQE 不等于 Child 已经落盘、digest 正确或 Piece metadata 已提交；Dragonfly 的最终成功条件仍由 Child Storage 决定。
 
-
 ## 8.测试方案
 
-### 8.1. 功能正确性验证
+### 8.1 功能正确性验证
 
 目标：
 
 验证 URMA 作为 Dragonfly 数据传输后端后，数据链路是否正确。
 
 测试环境：
-```
+
+```text
 Parent Peer                  Child Peer
 
 Dragonfly Server             Dragonfly Client
@@ -838,6 +856,7 @@ Piece数据校验
 下载文件 hash 与源文件一致；
 Piece offset、length、digest正确；
 数据传输无丢失、无错误。
+
 #### 8.1.2 多 Piece 并发下载
 
 验证：
@@ -851,12 +870,14 @@ CQE完成事件映射。
 request_id是否正确匹配Piece；
 多buffer是否正常复用；
 数据乱序情况下是否正确处理。
+
 #### 8.1.3 缓存场景
 
 验证：
 
 第一次：
-```
+
+```text
 Origin
 
   |
@@ -867,14 +888,17 @@ Parent Cache
 
 Child
 ```
+
 后续：
-```
+
+```text
 Parent Cache
 
   |
 
 Child
 ```
+
 检查：
 
 是否减少Origin访问；
@@ -894,23 +918,26 @@ Cache命中是否正常。
 | QUIC | 现有传输方式 |
 | URMA | 新增传输方式   |
 
-
 测试变量：
 
 **文件规模**
 例如：
-```
+
+```text
 MB级文件
 GB级文件
 AI模型文件
 ``` 
+
 **并发规模**
 例如：
-```
+
+```text
 单任务
 多任务
 多Peer并发
 ```
+
 测试指标：
 
 - 端到端时延
