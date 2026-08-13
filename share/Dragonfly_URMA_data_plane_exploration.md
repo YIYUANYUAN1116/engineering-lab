@@ -229,20 +229,22 @@ Context
 
 Provider / Hardware
 ```
-
-|组件|作用|
-|-|-|
-|Context|URMA上下文|
-|JFR|接收请求队列|
-|JFC|完成事件队列|
-|Jetty|通信端点|
-|Segment|注册内存|
-|WR|发送/接收请求|
-|CQE|完成事件|
-
+| 对象 | 回答的问题 | 典型生命周期 |
+|---|---|---|
+| liburma | 应用通过什么统一接口访问 URMA能力 | 进程级初始化到退出 |
+| Context | 使用哪个设备、通信资源归属在哪里 | 一组通信资源的总生命周期 |
+| Jetty | 通信双方的逻辑端点是什么 | 通信关系建立到断开 |
+| JFS| 发送数据时，提交哪些发送请求 | 与Jetty共同存在，直到通信关闭 |
+| JFR| 接收数据时，提前准备哪些接收Buffer | 与Jetty共同存在，通过post_recv持续补充 |
+| JFC | 到哪里获取异步操作完成结果 | 与关联JFS/JFR共同存在 |
+| Segment | 设备可以访问哪块注册内存 | 注册成功到注销释放 |
+| WR| 这一次请求设备执行什么操作 | 构造、提交、完成 |
+| CQE/完成结果 | 哪个WR完成、执行结果如何 | 设备产生到应用消费 |
 ---
 
-## 5. URMA 初始化流程
+## 5. URMA 通信
+
+### 5.1 URMA初始化
 
 ```text
 urma_init
@@ -292,9 +294,35 @@ Bind
 
 Ready
 ```
+### 5.2 URMA 收发时序图
+~~~mermaid
+sequenceDiagram
+    participant RApp as 接收方应用
+    participant RJ as 接收方 Jetty/JFR
+    participant RDev as 接收方 UB 设备
+    participant SApp as 发送方应用
+    participant SJ as 发送方 Jetty/JFS
+    participant SDev as 发送方 UB 设备
 
+    RApp->>RApp: 准备并注册接收 Segment
+    RApp->>RJ: 提前 post RECV WR
+    RJ->>RDev: 接收队列就绪
 
-## 6. 数据流转对比：TCP vs URMA
+    SApp->>SApp: 准备并注册发送 Segment
+    SApp->>SJ: post SEND WR
+    SJ->>SDev: 提交发送工作
+    SDev->>RDev: 通过 UB Fabric 传输消息
+    RDev->>RDev: DMA 写入已投递的接收 buffer
+
+    SDev-->>SJ: 产生发送 CQE
+    RDev-->>RJ: 产生接收 CQE
+    SApp->>SJ: poll JFC
+    SJ-->>SApp: 发送完成结果
+    RApp->>RJ: poll JFC
+    RJ-->>RApp: 接收完成结果与实际长度
+~~~
+
+## 6. 数据路径对比：
 
 ### 6.1 TCP 数据路径
 
@@ -345,31 +373,6 @@ User Buffer
 
 Application
 ```
-
-TCP特点:
-```text
-用户态 Buffer
-      |
-      v
-Kernel Socket Buffer
-      |
-      v
-NIC
-      |
-      v
-Network
-      |
-      v
-NIC
-      |
-      v
-Kernel Socket Buffer
-      |
-      v
-用户态 Buffer
-```
-
-
 
 ---
 
@@ -439,36 +442,6 @@ User Buffer
 
 Application
 
-```
-
-QUIC特点：
-
-```text
-用户态 Buffer
-      |
-      v
-QUIC Library
-      |
-      v
-UDP Socket Buffer
-      |
-      v
-NIC
-      |
-      v
-Network
-      |
-      v
-NIC
-      |
-      v
-UDP Socket Buffer
-      |
-      v
-QUIC Library
-      |
-      v
-用户态 Buffer
 ```
 
 ### 6.3 URMA 数据路径
@@ -762,107 +735,191 @@ UB网络拓扑
 内存资源
 
 
-## 8.测试阶段
+## 8.测试方案
 
-### 8.1：URMA基础能力测试
-目的：
+### 8.1. 功能正确性验证
 
-验证URMA通信能力。
+目标：
 
-环境：
+验证 URMA 作为 Dragonfly 数据传输后端后，数据链路是否正确。
 
+测试环境：
 ```
-Node A
+Parent Peer                  Child Peer
 
-URMA Parent
+Dragonfly Server             Dragonfly Client
 
-        |
-
-        |
-
-Node B
-
-URMA Child
+     |                            |
+     |                            |
+     +------ URMA Transport ------+
 ```
-```
-验证：
 
-init
-device发现
-context创建
-jetty创建
-shutdown
-通信
+测试内容：
+
+#### 8.1.1 单文件下载
 
 验证：
 
-SEND/RECV
-CQE
-数据正确性
-```
-### 8.2 Dragonfly + URMA功能测试
+文件完整性
+Piece数据校验
 
-单文件下载 
-验证：
-```
- 文件完整性；
- Piece数据校验正确性。
-```
-多Piece并发 
+检查：
+
+下载文件 hash 与源文件一致；
+Piece offset、length、digest正确；
+数据传输无丢失、无错误。
+#### 8.1.2 多 Piece 并发下载
+
 验证：
 
-```
- 多request_id并发管理；
- TX/RX Buffer资源复用；
- CQE到Piece任务的完成事件路由正确性。
-```
-Cache场景
+多请求并发处理；
+Buffer资源管理；
+CQE完成事件映射。
+
+关注：
+
+request_id是否正确匹配Piece；
+多buffer是否正常复用；
+数据乱序情况下是否正确处理。
+#### 8.1.3 缓存场景
+
 验证：
 
-```
 第一次：
-
+```
 Origin
 
- |
+  |
 
 Parent Cache
 
- |
-
-Child
-
-第二次：
-
-Parent Cache
-
- |
+  |
 
 Child
 ```
-### 8.3 性能测试
+后续：
+```
+Parent Cache
 
-通过构造不同文件大小、不同任务并发量的测试场景，对比 TCP、QUIC、URMA 三种数据传输方案的：
+  |
+
+Child
+```
+检查：
+
+是否减少Origin访问；
+Cache命中是否正常。
+
+### 8.2 性能对比测试
+
+目标：
+
+评估 URMA 相比现有 TCP/QUIC 的收益。
+
+对比方案：
+
+| 方案   | 说明       |
+| ---- | -------- |
+| TCP  | 现有传输方式 |
+| QUIC | 现有传输方式 |
+| URMA | 新增传输方式   |
+
+
+测试变量：
+
+**文件规模**
+例如：
+```
+MB级文件
+GB级文件
+AI模型文件
+``` 
+**并发规模**
+例如：
+```
+单任务
+多任务
+多Peer并发
+```
+测试指标：
 
 - 端到端时延
 - 网络吞吐率
 - Peer资源占用
+- CPU利用率
+- 内存占用
 
-评估 URMA 相比现有 TCP/QUIC 方案在大规模文件分发场景下的性能收益，并分析不同方案的适用场景。
+### 8.3 稳定性测试
 
+目标：
 
-## 9.当前阶段
-当前完成
+    验证长时间运行和异常情况下可靠性。
 
-已完成：
+测试：
 
-- Dragonfly架构和数据路径分析
-- Downloader接入点分析
-- URMA通信模型分析
-- URMA Transport Demo设计
+    长时间大文件传输；
+    Parent异常退出；
+    网络异常；
+    URMA连接断开；
+    Buffer耗尽。
 
-待完成:
+关注：
 
-- URMA Transport Demo 通信验证
-- Dragonfly URMA适配
-- Dragonfly URMA功能/性能测试
+    是否存在资源泄漏；
+    是否可以恢复；
+    是否影响其他任务。
+
+## 9. 当前进展与后续计划
+
+### 已完成
+
+已完成前期技术分析、方案设计及基础原型验证：
+
+- Dragonfly架构及数据路径分析；
+- Dragonfly Downloader数据面接入点分析；
+- URMA通信模型及数据传输流程分析；
+- Dragonfly接入URMA初步方案设计
+- URMA Transport Demo实现；
+- URMA Parent/Child通信链路验证；
+- SEND/RECV流程及CQE完成处理验证。
+
+---
+
+### 待完成
+
+后续围绕Dragonfly接入URMA开展：
+
+#### 1. Dragonfly URMA数据面适配
+
+完成：
+
+- UrmaDownloader模块设计与实现；
+- Piece请求/响应流程适配；
+- URMA Buffer生命周期管理；
+- Piece数据流转验证。
+
+#### 2. Dragonfly + URMA功能验证
+
+完成：
+
+- 单文件下载验证；
+- 多Piece并发下载验证；
+- Cache场景验证；
+
+#### 3. Dragonfly + URMA性能测试
+
+完成：
+
+- TCP/QUIC/URMA方案对比；
+- 不同文件规模测试；
+- 不同任务并发量测试；
+- 时延、吞吐率、Peer资源占用分析。
+
+#### 4. Dragonfly + URMA 稳定性测试
+
+完成：
+
+- 长时间运行测试；
+- 大规模文件持续传输测试；
+- 多Peer并发运行稳定性测试；
+- 异常场景恢复测试。
