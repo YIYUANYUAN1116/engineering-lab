@@ -734,6 +734,76 @@ UB网络拓扑
 延迟
 内存资源
 
+### 7.5 初步方案时序图
+#### 7.5.1 Child 流程
+
+```mermaid
+sequenceDiagram
+    participant PM as Piece::download_from_parent
+    participant UD as UrmaDownloader
+    participant UC as UrmaConnection
+    participant CP as Completion Poller
+    participant BP as BufferPool
+    participant PS as PieceContentStream
+    participant ST as Storage
+
+    PM->>UD: download_piece(peer, task_id, number)
+    UD->>UC: allocate request_id + register RequestState
+    UC->>BP: acquire TX slot； encode Request
+    UC->>UC: post SEND WR
+    CP-->>UC: send CQE； release TX slot
+    CP-->>UD: recv CQE： Metadata(offset, length, digest)
+    UD-->>PM: return (PieceContentStream, offset, digest)
+    PM->>ST: download_piece_from_parent_finished(stream)
+    loop each Data message
+        CP->>BP: resolve RX BufferSlot by user_ctx
+        CP->>CP: validate status/request_id/seq/payload_len
+        CP->>PS: copy payload into Bytes； channel.send(Bytes)
+        CP->>BP: repost RX slot
+        ST->>PS: poll next Bytes
+        ST->>ST: CRC32 + pwritev
+    end
+    CP-->>PS: End or transport/application error
+    ST->>ST: length + digest check； metadata commit
+```
+
+- [架构推断] `download_piece()` 只需等待 Metadata message，不需等待整个 body；RequestState 中的 bounded channel receiver 被包装为 `PieceContentStream`。
+- [架构推断] 第一版允许 copy：poller 从已完成 RX slot 复制有效 payload 为独立 `Bytes`，再 repost slot；Storage 后续持有的是普通 Bytes，不再引用注册 Segment。
+- [架构推断] bounded channel 提供应用层背压；当 channel 满时，poller 不应阻塞所有 Peer 的 CQ 处理，而应将拷贝后的 chunk 交给非 poller 的 async dispatcher，或以 credit 限制 Parent 发送。
+- [待实验验证] 原型在单 Piece 下可先用小的固定 RX depth 与“一个 chunk 确认/一个 credit”限制 outstanding body 数；是否需要专门 credit message 取决于目标 Jetty/transport 的 RNR 行为和 queue depth。
+
+#### 7.5.2  Parent 流程
+
+```mermaid
+sequenceDiagram
+    participant CP as Completion Poller
+    participant US as UrmaServer
+    participant ST as Storage
+    participant RR as RangeReader
+    participant BP as BufferPool
+    participant J as Jetty
+
+    CP->>US: recv CQE: Request(task_id, piece_number)
+    CP->>CP: copy/parse request ； repost request RX slot
+    US->>ST: piece_id() ； upload_piece()
+    ST-->>US: Piece metadata + RangeReader
+    US->>BP: acquire TX slot ； encode Metadata
+    US->>J: post SEND WR(Metadata)
+    CP-->>US: send CQE；release TX slot
+    loop until piece length sent
+        US->>RR: read next chunk into TX BufferSlot
+        US->>J: post SEND WR(Data, request_id, seq, len)
+        CP-->>US: send CQE； release；reuse TX slot
+    end
+    US->>J: post SEND WR(End) or Error
+    CP-->>US: final send CQE； finish upload request state
+```
+
+- [源码确认] Parent 的可复用数据源是 `Storage::upload_piece()` 返回的 RangeReader；URMA SEND/RECV 无法直接复用 Linux TCP server 的 `sendfile` 快路径。
+- [架构推断] Parent 必须把 RangeReader 分块读入已注册 TX slot，并在对应 send CQE 成功后才能重写或回收该 slot。
+- [URMA源码确认] post API 的同步返值只反映 WR 是否成功入队；数据面异步结果必须检查 send CQE/`urma_cr_t.status`。
+- [架构推断] Parent send CQE 不等于 Child 已经落盘、digest 正确或 Piece metadata 已提交；Dragonfly 的最终成功条件仍由 Child Storage 决定。
+
 
 ## 8.测试方案
 
