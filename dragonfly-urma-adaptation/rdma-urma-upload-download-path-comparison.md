@@ -20,11 +20,17 @@
 
 URMA 当前已完成 native/Fabric/lane/session，以及 client 侧下载 adapter（`client::urma`）与
 `URMADownloader` 注册到 `DownloaderFactory`（discovery 缓存、penalty/backoff、fabric 懒初始化、
-per-parent Session 复用、失败退休）。尚未进入 dfdaemon production path 的是 server 侧
-（`server::urma`）、`piece.rs`
-整体 fallback 与 dfdaemon `main.rs`/TCP discovery wiring。后续 adapter
+per-parent Session 复用、失败退休）。server 侧 listener/admission/readiness、dfdaemon optional
+task 和 TCP `DFUR` discovery 已接入；尚未进入 production path 的是 `piece.rs` 整体 fallback。
+现有 adapter
 应复用 Dragonfly 的 Storage、Downloader、限流、metrics 和 TCP fallback，不复制 demo 的文件传输
 或 benchmark 结构。
+
+接口对齐只发生在业务边界：两者都通过 `Downloader::download_*` 返回
+`PieceContentStream + offset + digest`，server 都提供 optional `run`/readiness/discovery 语义。
+RDMA `acquire_buffer`/`PooledBuf`、tagged post/CQ 与 URMA fixed slot、Jetty credit/owner-thread command
+属于各自 transport-private 实现，不要求同名同参，也不得暴露给 `piece.rs`。URMA 已将
+`RuntimeConfig`、`UrmaLaneConfig`、`UrmaServerHandler` 和 registry mutation 收回 storage 内部。
 
 ## 2. 下载路径
 
@@ -80,18 +86,18 @@ dfdaemon UrmaServer task
 
 | 链路阶段 | RDMA production path | URMA 当前对应 | 状态 |
 |---|---|---|---|
-| dfdaemon server task | `RDMAServer::run` | 无 | 待实现 |
-| listener/readiness | TCP listener + `CapabilityRegistry` | capability codec | 待实现 |
-| connection/transfer admission | semaphore | Fabric 普通命令 admission | server admission 仍待实现 |
+| dfdaemon server task | `RDMAServer::run` | `UrmaServer::run` optional task | 已完成 |
+| listener/readiness | TCP listener + `CapabilityRegistry` | listener + live `CapabilityRegistry` + `DFUR` discovery | 已完成 |
+| connection/transfer admission | semaphore | connection semaphore + Fabric command admission | 已完成（BUSY typed reply） |
 | peer transport 建立 | 共享 endpoint + per-Piece request | `UrmaServerSession::accept` + bind Jetty | 已有 |
 | Piece 请求 | handler 读 Request | `receive_request` | 已有 |
-| metadata lookup | `Storage::get_*` | 无 | adapter 待实现 |
-| not-found/busy/internal reply | RDMA `abort(Error frame)` | `reject_piece(code, message)` | 2026-08-26 已完成 |
-| bandwidth limiter/metrics | 已有 | 无 | adapter 待实现 |
-| Storage 数据源 | `open_piece_source`/`RangeReader`/optional mmap | `next_window_len` 等待输入 | RangeReader adapter 待实现 |
+| metadata lookup | `Storage::get_*` | `UrmaServerHandler::piece_metadata`，覆盖三类 Piece | 已完成 |
+| not-found/busy/internal reply | RDMA `abort(Error frame)` | handler + `reject_piece(code, message)` | 已完成（BUSY 等 listener admission） |
+| bandwidth limiter/metrics | 已有 | handler upload limiter + started/finished/failure/traffic | 已完成 |
+| Storage 数据源 | `open_piece_source`/`RangeReader`/optional mmap | `upload_* -> RangeReader -> bounded owned window` | 已完成（不做 mmap） |
 | receive-ready + SEND/completion | handler + Fabric | `send_next_window` + Fabric | 已对齐 |
 | Piece Done | Done 后连接结束 | `finish_piece` 后 session 回 Idle | 已对齐；持久复用 |
-| server shutdown/drain | task shutdown + Fabric close | Fabric drain/shutdown | orchestration 待实现 |
+| server shutdown/drain | task shutdown + Fabric close | clear advertisement -> close listener -> abort/drain lanes -> Fabric shutdown | 已完成（真机待验） |
 
 Phase A 只使用 `RangeReader::read_exact` 填充一个 owned window。RDMA 的 mmap、双 registered send
 ring、Storage read 与 NIC send overlap 归入后续优化。
@@ -130,10 +136,10 @@ ring、Storage read 与 NIC send overlap 归入后续优化。
 | `client::urma` + `PieceContentStream` | 已完成（含 Done gate/整 Piece timeout） | normal/persistent/cache Piece 双端 |
 | `URMADownloader` 接入 `DownloaderFactory` | 已完成 | 真机 discovery/fallback 决策 |
 | config `UrmaServer`（dfdaemon） | 已完成 | example YAML + 运行验证 |
-| `server::urma` + Storage/RangeReader | 未开始 | not-found、尾 window、限流 |
-| dfdaemon server wiring（listener/readiness） | 未开始 | optional capability/fallback |
-| `piece.rs` 整体 fallback + dfdaemon `main.rs` | 未开始 | URMA+Storage finish 失败后 TCP 重下 |
-| metrics/shutdown orchestration | 未开始 | feature-on daemon lifecycle |
+| `server::urma` + Storage/RangeReader | 已完成（纯测试/编译） | 三类 Piece 双端、not-found、尾 window、限流 |
+| dfdaemon server wiring（listener/readiness） | 已完成（纯测试/编译） | optional capability 真机验证 |
+| `piece.rs` 整体 fallback | 未开始 | URMA+Storage finish 失败后 TCP 重下 |
+| metrics/shutdown orchestration | 已完成基础 wiring | 真机 outstanding WR shutdown |
 | zero-copy、双 window、mmap | 后续优化 | benchmark 证明收益 |
 
 当前验证：
@@ -141,9 +147,10 @@ ring、Storage read 与 NIC send overlap 归入后续优化。
 ```text
 cargo fmt --all -- --check                                    PASS
 cargo check -p dragonfly-client --features urma                PASS
-cargo test -p dragonfly-client-storage --features urma urma::  28 passed / 0 failed
+cargo test -p dragonfly-client-storage --features urma urma::  32 passed / 0 failed
+cargo test ... discovery_is_fail_closed_until_listener_publishes  1 passed / 0 failed
 cargo test -p dragonfly-client --features urma --lib           PASS（URMADownloader 退避/分类 5 例）
-cargo test -p dragonfly-client-config                          PASS（UrmaServer 默认值/校验/serde 4 例）
+cargo test -p dragonfly-client-config                          47 passed / 0 failed
 ```
 
 说明：

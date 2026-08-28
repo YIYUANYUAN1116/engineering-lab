@@ -20,9 +20,10 @@
 > fabric 懒初始化、per-parent persistent Session slot、最终 `Done` gate、整 Piece timeout 与延迟失败
 > 退休；`dragonfly-client-config` 已新增 `UrmaServer` 配置段、组合校验与 serde 测试；
 > `UrmaClient` 超时改为从 `config.storage.server.urma.transfer_timeout` 读取。`--features urma`
-> 下 `cargo check` 通过、相关单测通过。未完成：`server::urma` adapter、`piece.rs` 的
-> URMA + Storage finish 整体 fallback、dfdaemon `main.rs` wiring 与 TCP discovery 分支、
-> 真实 provider 验证。
+> 下 `cargo check` 通过、相关单测通过。`server::urma::UrmaServerHandler` 也已完成三类 Storage
+> metadata/RangeReader、limiter/metrics 和有界 window adapter。`UrmaServer` listener、connection
+> admission、readiness registry、TCP `DFUR` discovery、dfdaemon optional task 与显式 Fabric shutdown
+> 也已接入。未完成：`piece.rs` 的 URMA + Storage finish 整体 fallback 与真实 provider 验证。
 
 ## 1. 结论
 
@@ -209,7 +210,8 @@ Tokio / dfdaemon
 |-- UrmaDownloader（已实现，`client::urma` 驱动）
 |     `-- metadata return + PieceContentStream receive window stream
 
-|-- UrmaServer（待实现）
+|-- UrmaServer / UrmaServerHandler（已实现）
+|     |-- listener + admission + readiness publication
 |     `-- Storage/RangeReader + lane send commands
 |
 `-- dedicated urma-engine OS thread
@@ -223,7 +225,7 @@ Tokio/storage side
       |-- UrmaClientSession / UrmaServerSession（已实现）
       |-- 同一 lane 最多一个 active Piece
       |-- client::urma adapter（已实现）
-      `-- server::urma adapter（待实现）
+      `-- server::urma adapter（已实现）
 ```
 
 ### 5.1 `UrmaFabricHandle`（已实现）
@@ -504,13 +506,13 @@ client/dragonfly-client-storage/src/server/urma.rs   （待实现）
 | --- | --- |
 | storage `Cargo.toml` / `build.rs` | 新增独立 `urma` feature；feature-on bindgen、编译 shim、链接 `liburma`（已完成） |
 | storage `client/mod.rs` | feature gate 导出 `client::urma`（已完成） |
-| storage `server/mod.rs` | feature gate 导出 `server::urma` |
+| storage `server/mod.rs` | feature gate 导出 `server::urma`（已完成） |
 | config `dfdaemon.rs` | 新增 `UrmaServer` 配置、默认值和组合校验（已完成） |
 | dragonfly-client `Cargo.toml` | `urma = ["dragonfly-client-storage/urma"]`（已完成） |
 | `piece_downloader.rs` | 新增 `UrmaDownloader`，接入 discovery cache/health backoff（已完成） |
 | `piece.rs` | 将“URMA 下载 + Storage finish”作为一个可失败单元；任意错误后重置 partial Piece 并完整 TCP 重下 |
-| dfdaemon `main.rs` | 创建一次 shared `UrmaFabric`，注入 downloader/server；按 readiness publish/clear capability；参与 shutdown |
-| TCP server discovery 分支 | 识别独立 URMA discriminator并返回 URMA advertisement |
+| dfdaemon `main.rs` | 启动 optional `UrmaServer` task；server/downloader 通过 `get_or_start` 复用相同配置的 process Fabric；参与 shutdown（已完成） |
+| TCP server discovery 分支 | 识别独立 `DFUR` discriminator 并只返回 live URMA advertisement（已完成） |
 | docs/tests/config examples | 增加 feature、运行依赖、配置和真实 provider 验证说明 |
 
 ### 9.3 配置
@@ -527,12 +529,13 @@ client/dragonfly-client-storage/src/server/urma.rs   （待实现）
 | `device` | `Option<String>` | `None` | UMDK 设备名，映射 `RuntimeConfig.device_name` |
 | `eidIndex` | `u32` | `0` | UMDK EID 索引，映射 `RuntimeConfig.eid_index` |
 | `fabricTag` | `Option<String>` | `None` | 可达域标签，映射 `UrmaCapability.fabric_tag` |
-| `maxInflightChunks` | `u32` | `512` | 单 piece 并发 receive window 数，映射 lane `recv_depth` |
+| `maxInflightChunks` | `u32` | `512` | 单 Piece window 上限；映射 client receive depth 与 server send/recv depth |
+| `maxConcurrentTransfers` | `u32` | `64` | server 同时接纳的 persistent peer lane 上限；满载返回 typed BUSY |
 | `transferTimeout` | `Duration` | `30s` | 单次 URMA 操作超时；`client::urma` 与 discovery 均从它取值 |
 
-组合校验：`maxInflightChunks` ∈ [1, 4096]、`transferTimeout` ∈ [1s, 10m]、`fabricTag` 非空。
-`device`/`fabricTag` 为空时，[`URMADownloader::fabric()`](../../../dev/dragonfly/client/dragonfly-client/src/resource/piece_downloader.rs)
-返回 `Unsupported` 并回落 TCP。
+组合校验：`maxInflightChunks` ∈ [1, 4096]、`maxConcurrentTransfers` ∈ [1, 65535]、
+`transferTimeout` ∈ [1s, 10m]、`fabricTag` 非空。`device`/`fabricTag` 为空时，server 不发布
+capability；downloader 返回 `Unsupported` 并回落 TCP。
 
 ```yaml
 storage:
@@ -544,6 +547,7 @@ storage:
       eidIndex: 0
       fabricTag: supernode-a
       maxInflightChunks: 512
+      maxConcurrentTransfers: 64
       transferTimeout: 30s
 
 download:
@@ -711,8 +715,9 @@ WR 的 drain/timeout 路径可诊断。
 `handle_download`）以有界 window 流式投递 `PieceContentStream`，`UrmaClientSession` 在 `Ready`
 后立即返回 metadata；最后一个 window 只在 `Done` 成功后发布，后台 transfer 受整 Piece timeout
 约束。`URMADownloader` 已注册到 `DownloaderFactory`，并按 parent 缓存单 Session slot，顺序 Piece
-复用 TCP control connection/Jetty；production `piece.rs` 选择和整体 TCP fallback 尚待接入。Parent
-侧（Storage metadata、`RangeReader`、`server::urma`）仍待实现。
+复用 TCP control connection/Jetty。Parent 侧 `UrmaServerHandler` 已按 PieceKind 查询三类 metadata，
+调用 `upload_*`/`RangeReader`，复用一个有界 owned window 并执行 limiter/metrics/error reply；
+listener/admission/readiness/discovery 已接入；production `piece.rs` 选择和整体 TCP fallback 尚待接入。
 
 交付门槛：4 MiB、64 MiB 和尾部非整 payload Piece 两节点成功；stream 在 Metadata 后立即返回；
 内存不会随 Piece length 增长。
@@ -727,8 +732,9 @@ WR 的 drain/timeout 路径可诊断。
 - fault injection和真实 provider回归；
 - 运维构建/运行文档。
 
-当前进度（2026-08-28）：尚未开始；`piece.rs` 的“URMA 下载 + Storage finish”整体 fallback、
-dfdaemon `main.rs` wiring 与 TCP discovery 分支仍待接入。
+当前进度（2026-08-28）：server lifecycle 部分已完成——dfdaemon optional task、TCP `DFUR`
+discovery、live capability publish/clear、connection semaphore/BUSY reply、Fabric failure 退订和显式
+shutdown 已接入。`piece.rs` 的“URMA 下载 + Storage finish”整体 fallback 仍待接入。
 
 交付门槛：第 2.2 节验收矩阵全部通过，并明确区分 unit、feature-on compile、software/mock 与
 真实 UDMA provider 结果。
@@ -818,12 +824,11 @@ lane reuse 问题推迟，不能作为后续并发阶段的可靠基础，因此
 
 ## 16. 当前下一步
 
-A0/A1、A2 transport foundation 和 client adapter 已完成代码基线，不再重做 lane/session 架构。
+A0/A1、A2 transport foundation、client/server adapter，以及 dfdaemon listener/admission/readiness/
+discovery/shutdown 已完成代码基线，不再重做 lane/session 架构。
 后续按以下顺序闭环：
 
-1. 实现 `server::urma` 的 Storage metadata、`RangeReader`、admission、limiter 与 metrics adapter；
-2. 接 dfdaemon URMA listener/readiness/discovery 和进程级 Fabric shutdown；
-3. 在 `piece.rs` 接入 normal/persistent/cache 三条 URMA 路径，并把“URMA stream + Storage finish”
+1. 在 `piece.rs` 接入 normal/persistent/cache 三条 URMA 路径，并把“URMA stream + Storage finish”
    作为整体失败单元完整 TCP 重下；
-4. 用真实 provider 验证同一 lane 顺序传输至少 10 个 Piece、尾 window、慢消费和错误清理；
-5. 只有 benchmark 证明 copy-RX 是瓶颈后，再做 registered-window/双 window 优化。
+2. 用真实 provider 验证同一 lane 顺序传输至少 10 个 Piece、尾 window、慢消费和错误清理；
+3. 只有 benchmark 证明 copy-RX 是瓶颈后，再做 registered-window/双 window 优化。
