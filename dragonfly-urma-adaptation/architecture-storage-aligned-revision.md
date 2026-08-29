@@ -94,7 +94,9 @@ Dragonfly/RDMA rendezvous 与 Piece contract 出发，在需要 UMDK descriptor 
   `futures::channel::mpsc` 把 owned `Bytes` window 流式投递成 `PieceContentStream`。最后一个 window
   只在 `Done` 校验成功后发布，整个后台 Piece transfer 受 `piece_timeout` 约束；延迟失败会退休
   parent client，并进入 penalty/backoff。`URMADownloader` 已注册到 `DownloaderFactory`，但
-  `piece.rs` production 选择与 Storage finish 整体 TCP fallback 仍待接入；
+  `piece.rs` 已通过 transport-neutral `Downloader` 边界接入 normal/persistent/cache 三条
+  production path；URMA 返回 stream 后任何传输/Storage finish 错误都会 reset partial Piece
+  并整块 TCP 重下；
 - `server::urma::UrmaServerHandler` 已实现 Storage adapter：按 PieceKind 查询三类 metadata，调用
   现有 `upload_*` 获得 `RangeReader`，在 upload limiter 后复用一个有界 owned window，并按
   `next_window_len -> read_exact -> send_next_window` 驱动 Session；not-found/invalid/internal 使用
@@ -104,7 +106,8 @@ Dragonfly/RDMA rendezvous 与 Piece contract 出发，在需要 UMDK descriptor 
   discovery，dfdaemon 已按 optional fast-path 启动，失败不会终止 TCP/QUIC；
 - `dragonfly-client-config` 已新增 `UrmaServer`（`StorageServer.urma`），`UrmaClient` 超时从
   `storage.server.urma.transfer_timeout` 读取；
-- 尚未实现 `piece.rs` 整体 fallback，真实 Piece 闭环未验证。
+- `piece.rs` 整体 fallback 已实现，真实 Piece 闭环与中途断链后 TCP 重下仍未在
+  UMDK provider 上验证。
 
 ### 4.3 通用 rendezvous 与 URMA receive credit
 
@@ -132,8 +135,8 @@ peer 的连续、非零 `RecvPosted` window 后，才能通过
 post 消费一个 credit。这样本地 lane Ready 与 peer receive-ready 被明确分离。
 
 storage-private session adapter 已实现上述 primitives 的串联；client downloader adapter 与
-server/Storage adapter、dfdaemon listener/readiness/discovery 均已接入，`piece.rs` production path
-尚未接入。
+server/Storage adapter、dfdaemon listener/readiness/discovery 均已接入，`piece.rs` 三类
+production path 和 Storage finish 整体 TCP fallback 也已接入。
 控制面明确拆成两个生命周期：
 
 ```text
@@ -274,7 +277,8 @@ codec 流程；真实 owner progress、mark-error flush 与 shutdown 仍需 UMDK
   （已完成，2026-08-28）；
 - [x] 接 dfdaemon listener/discovery、connection admission、readiness 和 shutdown（已完成，
   2026-08-28）；
-- [ ] 接 `piece.rs` 的 URMA + Storage finish 整体 TCP fallback；
+- [x] 接 `piece.rs` 的 normal/persistent/cache URMA + Storage finish 整体 TCP fallback
+  （已完成，2026-08-28）；
 - [ ] 用真实 provider 验证一次建 lane 后顺序传输至少 10 个 Piece，以及 mark-error flush/reap；
 - [ ] 增加 native failure injection，覆盖 runtime close retry、owner poison、flush batch 和 shutdown；
 - [ ] 在真实吞吐基线证明 memcpy 是瓶颈后，把 `ReceivedChunk` backing 换成注册窗口 guard。

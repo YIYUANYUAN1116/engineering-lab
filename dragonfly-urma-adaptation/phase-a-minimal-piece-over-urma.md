@@ -23,7 +23,8 @@
 > 下 `cargo check` 通过、相关单测通过。`server::urma::UrmaServerHandler` 也已完成三类 Storage
 > metadata/RangeReader、limiter/metrics 和有界 window adapter。`UrmaServer` listener、connection
 > admission、readiness registry、TCP `DFUR` discovery、dfdaemon optional task 与显式 Fabric shutdown
-> 也已接入。未完成：`piece.rs` 的 URMA + Storage finish 整体 fallback 与真实 provider 验证。
+> 也已接入。`piece.rs` 的 normal/persistent/cache URMA 选择以及“URMA stream +
+> Storage finish”整体 TCP fallback 已完成。未完成：真实 provider Piece 闭环和故障注入验证。
 
 ## 1. 结论
 
@@ -421,7 +422,9 @@ UrmaServer async task
 ```
 
 当前 Session 已实现逐 window、逐 chunk post 和 completion wait。linked WR batch、双 window
-Storage-read/SEND overlap 留到 benchmark 后；TX slot 在对应 completion retirement 前不得复用。
+Storage-read/SEND overlap 已纳入
+[Phase B production 性能数据路径](./phase-b-performance-data-path.md)；TX slot 在对应 completion
+retirement 前不得复用。
 
 Parent 只有在收到 Child `RecvPosted` 后才能 grant 并消费对应数量的 SEND credit。abort/shutdown
 走 Fabric lifecycle path，不受普通业务 command admission 阻塞。
@@ -494,7 +497,7 @@ client/dragonfly-client-storage/src/urma/
   session.rs
 
 client/dragonfly-client-storage/src/client/urma.rs   （已实现）
-client/dragonfly-client-storage/src/server/urma.rs   （待实现）
+client/dragonfly-client-storage/src/server/urma.rs   （已实现）
 ```
 
 阶段 A 以迁移/收敛 demo 的 native foundation 为主，不让 production crate 依赖
@@ -510,7 +513,7 @@ client/dragonfly-client-storage/src/server/urma.rs   （待实现）
 | config `dfdaemon.rs` | 新增 `UrmaServer` 配置、默认值和组合校验（已完成） |
 | dragonfly-client `Cargo.toml` | `urma = ["dragonfly-client-storage/urma"]`（已完成） |
 | `piece_downloader.rs` | 新增 `UrmaDownloader`，接入 discovery cache/health backoff（已完成） |
-| `piece.rs` | 将“URMA 下载 + Storage finish”作为一个可失败单元；任意错误后重置 partial Piece 并完整 TCP 重下 |
+| `piece.rs` | 将“URMA 下载 + Storage finish”作为一个可失败单元；任意错误后重置 partial Piece 并完整 TCP 重下（已完成） |
 | dfdaemon `main.rs` | 启动 optional `UrmaServer` task；server/downloader 通过 `get_or_start` 复用相同配置的 process Fabric；参与 shutdown（已完成） |
 | TCP server discovery 分支 | 识别独立 `DFUR` discriminator 并只返回 live URMA advertisement（已完成） |
 | docs/tests/config examples | 增加 feature、运行依赖、配置和真实 provider 验证说明 |
@@ -670,8 +673,8 @@ outstanding WR 持有独立
 oneshot completion；已删除全局 completion event channel。无 outstanding WR 时 owner 阻塞等待
 命令；有 outstanding WR 时无需新命令也会持续 poll shared JFC。调用方 drop handle 不释放 native
 ownership；timeout 将 lane 置为 Draining/ERROR 并等待 CQE/flush 回收，不假设 liburma 有可靠的
-per-WR cancel。当前仍缺 dfdaemon client/server Storage adapter、真实 provider progress/mark-error
-flush/shutdown 验证；本地 lane Ready 仍不代表远端已 post RECV。
+per-WR cancel。dfdaemon client/server Storage adapter 已接入；当前仍缺真实 provider
+progress/mark-error flush/shutdown 验证。本地 lane Ready 仍不代表远端已 post RECV。
 
 控制面 foundation 同日完成：通用 frame envelope、Piece request/metadata、ReceiveWindow 和错误码
 已从 libfabric 专属 capability/endpoint/tag 中拆出；RDMA v2 wire 顺序由 golden test 固定；URMA
@@ -717,7 +720,9 @@ WR 的 drain/timeout 路径可诊断。
 约束。`URMADownloader` 已注册到 `DownloaderFactory`，并按 parent 缓存单 Session slot，顺序 Piece
 复用 TCP control connection/Jetty。Parent 侧 `UrmaServerHandler` 已按 PieceKind 查询三类 metadata，
 调用 `upload_*`/`RangeReader`，复用一个有界 owned window 并执行 limiter/metrics/error reply；
-listener/admission/readiness/discovery 已接入；production `piece.rs` 选择和整体 TCP fallback 尚待接入。
+listener/admission/readiness/discovery 已接入；production `piece.rs` 已通过通用
+`Downloader` 契约接入三类 Piece，且在 URMA stream/Storage finish 失败后 reset partial
+Piece 并整块 TCP 重下。
 
 交付门槛：4 MiB、64 MiB 和尾部非整 payload Piece 两节点成功；stream 在 Metadata 后立即返回；
 内存不会随 Piece length 增长。
@@ -734,7 +739,8 @@ listener/admission/readiness/discovery 已接入；production `piece.rs` 选择�
 
 当前进度（2026-08-28）：server lifecycle 部分已完成——dfdaemon optional task、TCP `DFUR`
 discovery、live capability publish/clear、connection semaphore/BUSY reply、Fabric failure 退订和显式
-shutdown 已接入。`piece.rs` 的“URMA 下载 + Storage finish”整体 fallback 仍待接入。
+shutdown 已接入。`piece.rs` 的 normal/persistent/cache URMA 选择和“URMA stream +
+Storage finish”整体 fallback 已接入；仍需真实 provider 闭环与故障注入验证。
 
 交付门槛：第 2.2 节验收矩阵全部通过，并明确区分 unit、feature-on compile、software/mock 与
 真实 UDMA provider 结果。
@@ -826,9 +832,17 @@ lane reuse 问题推迟，不能作为后续并发阶段的可靠基础，因此
 
 A0/A1、A2 transport foundation、client/server adapter，以及 dfdaemon listener/admission/readiness/
 discovery/shutdown 已完成代码基线，不再重做 lane/session 架构。
+真机命令、日志证据和验收口径见
+[real-provider validation runbook](./real-provider-validation-runbook.md)。当前已增加 lane
+create/reuse/abort/close 结构化日志，以及只在 `urma-test-failpoints` feature 中可用的
+`DF_URMA_FAIL_AFTER_RECV_WINDOWS` 真实 completion 故障注入。
 后续按以下顺序闭环：
 
-1. 在 `piece.rs` 接入 normal/persistent/cache 三条 URMA 路径，并把“URMA stream + Storage finish”
-   作为整体失败单元完整 TCP 重下；
-2. 用真实 provider 验证同一 lane 顺序传输至少 10 个 Piece、尾 window、慢消费和错误清理；
-3. 只有 benchmark 证明 copy-RX 是瓶颈后，再做 registered-window/双 window 优化。
+1. 同一 lane 顺序传输 256 Piece，以及 1 GiB + 12,345 bytes 的非整 Piece/chunk 尾部已由真实
+   provider 和端到端 SHA-256 验证；继续补慢消费和错误清理；
+2. 真机断链时确认 Session 退休、partial Piece reset 和 TCP 整块重下；本地故障注入已覆盖
+   请求前失败、三类 Piece 流中断、digest mismatch 和 Storage timeout；
+3. Phase A 真实 provider correctness gate 通过后进入
+   [Phase B production 性能数据路径](./phase-b-performance-data-path.md)，按 registered lease、RX
+   direct-write/双 window、TX direct-fill/双 ring、mmap 和 post/CQ batch 的依赖顺序实现；同口径
+   Dragonfly TCP/URMA benchmark 放在 Phase B 最终验收，不再作为这些已确认优化的前置条件。

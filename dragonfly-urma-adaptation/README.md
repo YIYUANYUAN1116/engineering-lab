@@ -19,6 +19,8 @@
 4. [RDMA/URMA 上传下载路径对比与进度台账](./rdma-urma-upload-download-path-comparison.md)
 5. [A0：transport core 机械迁移状态（历史）](./phase-a-a0-transport-core-migration-status.md)
 6. [A1：UrmaEngine owner thread 骨架状态（历史）](./phase-a-a1-engine-owner-status.md)
+7. [真实 Provider 验证 Runbook](./real-provider-validation-runbook.md)
+8. [Phase B：URMA production 性能数据路径](./phase-b-performance-data-path.md)
 
 ## 证据口径
 

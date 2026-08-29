@@ -21,8 +21,10 @@
 URMA 当前已完成 native/Fabric/lane/session，以及 client 侧下载 adapter（`client::urma`）与
 `URMADownloader` 注册到 `DownloaderFactory`（discovery 缓存、penalty/backoff、fabric 懒初始化、
 per-parent Session 复用、失败退休）。server 侧 listener/admission/readiness、dfdaemon optional
-task 和 TCP `DFUR` discovery 已接入；尚未进入 production path 的是 `piece.rs` 整体 fallback。
-现有 adapter
+task 和 TCP `DFUR` discovery 已接入。`piece.rs` 已通过通用 `Downloader` 边界接入
+normal/persistent/persistent-cache 三条 production path：URMA 建连/首读失败直接回退
+TCP，URMA stream 开始后的传输或 Storage finish 失败会先重置 partial Piece，再整块
+TCP 重下。现有 adapter
 应复用 Dragonfly 的 Storage、Downloader、限流、metrics 和 TCP fallback，不复制 demo 的文件传输
 或 benchmark 结构。
 
@@ -51,7 +53,7 @@ Piece::download_piece_from_parent
 
 | 链路阶段 | RDMA production path | URMA 当前对应 | 状态 |
 |---|---|---|---|
-| Piece 协议选择和 TCP fallback | `resource/piece.rs` | 无 | 待实现 |
+| Piece 协议选择和 TCP fallback | `resource/piece.rs` | 三类 Piece 均通过 `Arc<dyn Downloader>` 选择 URMA，并保留 TCP 地址 | 已完成（真机待验） |
 | capability discovery/cache/backoff | `RDMADownloader` + `discover` | `URMADownloader` + `discover` | 已完成 |
 | process fabric 初始化/失败退休 | `RDMADownloader::fabric` | `URMADownloader::fabric` + `UrmaFabric::start/shutdown/readiness` | 已完成（懒初始化/失败退休/掉线重连） |
 | peer connection | 每 Piece TCP rendezvous | `URMADownloader` 缓存 `UrmaClient`，单 Session slot 串行复用 lane | 已完成（真机复用待验） |
@@ -60,10 +62,11 @@ Piece::download_piece_from_parent
 | operation completion 校验 | tag/chunk/length | lane/sequence/length | 已对齐 |
 | 内容向上交付 | `RDMAStreamReader`/`PieceContentStream` | `client::urma` 投递 owned `Bytes` window | 已完成 |
 | Storage 写入和 digest | 通用 stream；另有 RDMA direct-window 优化 | 通用 stream（Storage 消费 `PieceContentStream`） | 已完成（Copy-RX） |
-| stream drop/timeout/fallback | retire endpoint/session，TCP 重下 | 最终 window 受 Done gate；整 Piece timeout；延迟失败退休 Session | 下层已完成，`piece.rs` 整体 TCP 重下待实现 |
+| stream drop/timeout/fallback | retire endpoint/session，TCP 重下 | 最终 window 受 Done gate；整 Piece timeout；延迟失败退休 Session；Storage 失败后 reset + 整块 TCP 重下 | 已完成（故障注入/真机待验） |
 
 Phase A 的 URMA adapter 使用 owned window -> `Bytes` -> bounded `PieceContentStream`。RDMA 的
-registered-window direct `pwrite + digest` 是优化，不作为 URMA 首次接入门槛。
+registered-window direct `pwrite + digest` 不作为 URMA 首次接入门槛，但已确定为
+[Phase B production 性能数据路径](./phase-b-performance-data-path.md) 的必做项。
 
 ## 3. 上传路径
 
@@ -100,7 +103,8 @@ dfdaemon UrmaServer task
 | server shutdown/drain | task shutdown + Fabric close | clear advertisement -> close listener -> abort/drain lanes -> Fabric shutdown | 已完成（真机待验） |
 
 Phase A 只使用 `RangeReader::read_exact` 填充一个 owned window。RDMA 的 mmap、双 registered send
-ring、Storage read 与 NIC send overlap 归入后续优化。
+ring、Storage read 与 NIC send overlap 已纳入
+[Phase B production 性能数据路径](./phase-b-performance-data-path.md)，不再作为未定的可选优化。
 
 ## 4. Session production contract
 
@@ -108,8 +112,9 @@ ring、Storage read 与 NIC send overlap 归入后续优化。
 
 - peer `Error` 不再压成普通 protocol string；`PeerRejected { code, message }` 保留
   incompatible/not-found/busy/internal，供 downloader fallback/backoff 决策；
-- 所有 TCP control read/write 受 `control_timeout` 约束，超时返回带 operation 名称的
-  `ControlTimeout`，并 retire 当前 lane；
+- active Piece 的 TCP control read/write 受 `control_timeout` 约束，超时返回带 operation 名称的
+  `ControlTimeout` 并 retire 当前 lane；空闲等待下一 Piece 使用独立 Session idle timeout，正常到期
+  close lane，不分类为 transport error；
 - `request_piece` 和 `receive_request` 返回 owned metadata/request，避免 adapter 在后续可变 Session
   调用前持有借用；
 - `UrmaServerSession::reject_piece` 可向 peer 返回明确错误并终止当前保守型 Phase A session；
@@ -131,25 +136,27 @@ ring、Storage read 与 NIC send overlap 归入后续优化。
 |---|---|---|
 | native Runtime/JFC/JFR/Segment/Jetty ownership | 已完成（纯测试/编译） | 真实 provider startup/shutdown |
 | per-operation completion、timeout、drain/reap | 已完成（纯测试/编译） | 真机 CQE/flush |
-| persistent lane + sequential Piece Session | client cache/slot 已接入（纯测试/编译） | 同 lane 10 Piece 双端测试 |
+| persistent lane + sequential Piece Session | 1 GiB 真机确认 client/server 各建立 1 lane、1 次 `reused=false`、255 次 `reused=true`；已修复并发 singleflight 和 30s active timeout 误杀 idle Session（storage 34/client 62 tests） | 等待 40s 跨任务复用；超过 450s 正常 idle close 后无 fallback 重连 |
 | Session production contract | 已完成 | adapter error/fallback 测试 |
-| `client::urma` + `PieceContentStream` | 已完成（含 Done gate/整 Piece timeout） | normal/persistent/cache Piece 双端 |
+| `client::urma` + `PieceContentStream` | 已完成（含 Done gate/整 Piece timeout）；1 GiB + 12,345 bytes 真机下载及 SHA-256 已通过 | persistent/cache Piece 双端 |
 | `URMADownloader` 接入 `DownloaderFactory` | 已完成 | 真机 discovery/fallback 决策 |
 | config `UrmaServer`（dfdaemon） | 已完成 | example YAML + 运行验证 |
-| `server::urma` + Storage/RangeReader | 已完成（纯测试/编译） | 三类 Piece 双端、not-found、尾 window、限流 |
+| `server::urma` + Storage/RangeReader | normal Piece 真机通过，含 4 MiB/64 KiB 均不能整除的 12,345-byte 尾部 | persistent/cache、not-found、限流真机验证 |
 | dfdaemon server wiring（listener/readiness） | 已完成（纯测试/编译） | optional capability 真机验证 |
-| `piece.rs` 整体 fallback | 未开始 | URMA+Storage finish 失败后 TCP 重下 |
+| `piece.rs` 整体 fallback | 已完成（normal/persistent/cache）；建连/请求前失败、三类流中断、digest mismatch、Storage timeout 已有故障注入测试 | 真机断链与 TCP 重下 |
 | metrics/shutdown orchestration | 已完成基础 wiring | 真机 outstanding WR shutdown |
-| zero-copy、双 window、mmap | 后续优化 | benchmark 证明收益 |
+| registered lease、RX direct-write、双 window、mmap、post/CQ batch | Phase B 已规划，待实现 | 按 B1-B7 顺序完成；真实 provider correctness 后做最终同口径 benchmark |
 
 当前验证：
 
 ```text
 cargo fmt --all -- --check                                    PASS
 cargo check -p dragonfly-client --features urma                PASS
-cargo test -p dragonfly-client-storage --features urma urma::  32 passed / 0 failed
+cargo test -p dragonfly-client-storage --features urma urma::  34 passed / 0 failed
 cargo test ... discovery_is_fail_closed_until_listener_publishes  1 passed / 0 failed
-cargo test -p dragonfly-client --features urma --lib           PASS（URMADownloader 退避/分类 5 例）
+cargo test -p dragonfly-client --features urma --lib           62 passed / 0 failed（含 URMA singleflight/退避/fallback）
+cargo test -p dragonfly-client --features urma --lib resource::piece::tests::test_urma_fallback_matrix
+                                                               1 passed / 0 failed（6 场景）
 cargo test -p dragonfly-client-config                          47 passed / 0 failed
 ```
 
