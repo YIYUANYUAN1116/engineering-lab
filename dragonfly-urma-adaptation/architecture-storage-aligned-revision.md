@@ -1,7 +1,7 @@
 # 架构修订：URMA 作为 Dragonfly Storage 内部传输后端
 
 > 决策日期：2026-08-25  
-> 最近更新：2026-08-28  
+> 最近更新：2026-08-26  
 > 状态：Accepted  
 > 取代：独立 `dragonfly-client-urma-transport` crate 方案
 
@@ -19,7 +19,7 @@ dragonfly-client-storage
   src/urma/lane.rs         owned Jetty、descriptor、WR identity 与 lane state
   src/urma/buffer.rs       process-wide registered slot pool
   src/urma/ffi/            pointer-free UMDK shim ABI
-  src/client/urma.rs       Piece download adapter（已实现）
+  src/client/urma.rs       Piece download adapter（后续实现）
   src/server/urma.rs       Piece upload adapter（后续实现）
 ```
 
@@ -89,25 +89,7 @@ Dragonfly/RDMA rendezvous 与 Piece contract 出发，在需要 UMDK descriptor 
 - progress/CQE/protocol error 会将 Fabric 标记为 `Failed/poisoned` 并唤醒全部 pending waiter，
   但 native WR、registered slot 仍保留到 CQE/flush 真正退休；operation timeout 会把所属 lane 置为
   Draining/ERROR、停止新 post，而不是伪造 liburma 不保证支持的 per-WR cancel；
-- `client::urma` 已实现：`discover` 做 TCP rendezvous 探测，`URMADownloader` 按 parent 缓存
-  `UrmaClient`，client 内的单 Session slot 串行复用同一 TCP control connection/Jetty；有界
-  `futures::channel::mpsc` 把 owned `Bytes` window 流式投递成 `PieceContentStream`。最后一个 window
-  只在 `Done` 校验成功后发布，整个后台 Piece transfer 受 `piece_timeout` 约束；延迟失败会退休
-  parent client，并进入 penalty/backoff。`URMADownloader` 已注册到 `DownloaderFactory`，但
-  `piece.rs` 已通过 transport-neutral `Downloader` 边界接入 normal/persistent/cache 三条
-  production path；URMA 返回 stream 后任何传输/Storage finish 错误都会 reset partial Piece
-  并整块 TCP 重下；
-- `server::urma::UrmaServerHandler` 已实现 Storage adapter：按 PieceKind 查询三类 metadata，调用
-  现有 `upload_*` 获得 `RangeReader`，在 upload limiter 后复用一个有界 owned window，并按
-  `next_window_len -> read_exact -> send_next_window` 驱动 Session；not-found/invalid/internal 使用
-  typed Error，整个 Piece 受 `piece_timeout` 约束；
-- `server::urma::UrmaServer` 已实现 listener、connection semaphore/BUSY reply、Fabric readiness
-  监听、capability publish/clear、连接任务回收和显式 shutdown；TCP Piece endpoint 已支持 `DFUR`
-  discovery，dfdaemon 已按 optional fast-path 启动，失败不会终止 TCP/QUIC；
-- `dragonfly-client-config` 已新增 `UrmaServer`（`StorageServer.urma`），`UrmaClient` 超时从
-  `storage.server.urma.transfer_timeout` 读取；
-- `piece.rs` 整体 fallback 已实现，真实 Piece 闭环与中途断链后 TCP 重下仍未在
-  UMDK provider 上验证。
+- 尚未实现 `client::urma`、`server::urma` 和真实 Piece 闭环。
 
 ### 4.3 通用 rendezvous 与 URMA receive credit
 
@@ -134,10 +116,8 @@ peer 的连续、非零 `RecvPosted` window 后，才能通过
 `UrmaFabricHandle::grant_send_credit` 授予对应数量的 remote receive credits；每次成功 native SEND
 post 消费一个 credit。这样本地 lane Ready 与 peer receive-ready 被明确分离。
 
-storage-private session adapter 已实现上述 primitives 的串联；client downloader adapter 与
-server/Storage adapter、dfdaemon listener/readiness/discovery 均已接入，`piece.rs` 三类
-production path 和 Storage finish 整体 TCP fallback 也已接入。
-控制面明确拆成两个生命周期：
+storage-private session adapter 已实现上述 primitives 的串联，但尚未接入 dfdaemon listener、
+Storage 和 downloader。控制面明确拆成两个生命周期：
 
 ```text
 peer lane（一次）: Connect(capability + client descriptor)
@@ -151,33 +131,6 @@ Piece（可重复）: Request -> Ready -> [post RECV -> RecvPosted -> grant cred
 Piece；descriptor 不再放进每个 Piece Request/Ready。Phase A 先固定顺序复用，后续若需要同一
 lane 并发 Piece，再在该边界增加 session id 和调度，不改变 Fabric/native ownership。
 
-### 4.4 业务接口与 transport-private 接口收敛
-
-2026-08-28 在接 `piece.rs` 前完成 public surface 审计。对齐原则是统一 Dragonfly 业务语义，
-不伪造 libfabric 与 liburma 并不共有的 native 资源 API：
-
-| 边界 | 对外契约 | 当前处理 |
-|---|---|---|
-| Piece 业务层 | `Downloader::download_* -> PieceContentStream + offset + digest` | TCP/QUIC/RDMA/URMA 统一 |
-| client adapter | `discover`、三类 `download_*`、失败退休 | RDMA/URMA 语义对齐 |
-| server adapter | `new`、capability registry、`run`、optional failure | RDMA/URMA 语义对齐 |
-| Fabric/native | buffer lease、post、completion、tag/credit、lane | provider-private，不做假统一 |
-
-本轮具体收敛：
-
-- `UrmaClient::new` 不再让上层传 `UrmaLaneConfig`，而是从 dfdaemon 的
-  `maxInflightChunks` 在 adapter 内构造 lane 参数；
-- `UrmaFabric::get_or_start` 对外只接收 device/EID，`RuntimeConfig` 与 `runtime` 模块退回
-  storage crate 内部；
-- `UrmaServerHandler` 退回模块私有，dfdaemon 只依赖 `UrmaServer`；
-- `CapabilityRegistry::publish/clear/get` 退回 storage crate 内部，dfdaemon 只负责创建并注入 registry；
-- URMA buffer/Session/post/completion API 保持 `pub(crate)`，业务 crate 没有直接调用者。
-
-RDMA 的 `Fabric::acquire_buffer` 是 dynamic registration/pool lease，实现上服务于 RDMA adapter；
-URMA 的 Segment/fixed slot 由 owner thread 独占，不能为了接口同名把 registered slot guard 暴露给
-业务层。Phase A 不为 URMA 增加 `acquire_buffer`，也不把 RDMA 的 registered-memory 直写特例定义成
-所有 transport 必须实现的业务接口。
-
 2026-08-26 Session production contract 已进一步收敛：peer Error 保留 code/message；全部 control
 read/write 有显式 timeout；request/metadata 使用 owned 返回；server 可以 `reject_piece`；协商的
 inflight 不得超过本地 Jetty 对应 send/recv depth。完整的 RDMA/URMA production path 对照和滚动
@@ -187,8 +140,7 @@ inflight 不得超过本地 Jetty 对应 send/recv depth。完整的 RDMA/URMA p
 
 ```text
 默认 rendezvous tests                             8 passed / 0 failed
-URMA module tests（含 protocol/credit/session/server adapter） 32 passed / 0 failed
-TCP discovery fail-closed test                         1 passed / 0 failed
+URMA module tests（含 protocol/credit/session）    27 passed / 0 failed
 cargo check -p dragonfly-client --features urma   PASS
 RDMA feature-gated Rust client/server type-check  PASS
 ```
@@ -262,7 +214,7 @@ cargo fmt --all -- --check                                      PASS
 cargo check -p dragonfly-client-storage                          PASS
 cargo check -p dragonfly-client --features urma                  PASS
 cargo test -p dragonfly-client-storage --features urma urma --lib
-32 passed / 0 failed
+27 passed / 0 failed
 ```
 
 上述测试覆盖命令/config DTO、per-operation completion/timeout、control timeout、typed peer error、
@@ -271,16 +223,12 @@ codec 流程；真实 owner progress、mark-error flush 与 shutdown 仍需 UMDK
 
 ## 5. 下一实现顺序
 
-- [x] 实现 `client::urma` 的 Piece receive stream、最终 `Done` gate、整 Piece timeout，以及
-  per-parent persistent Session slot（已完成，2026-08-28）；
-- [x] 实现 `server::urma` 的 Storage/RangeReader adapter，按 `next_window_len` 有界读取并发送
-  （已完成，2026-08-28）；
-- [x] 接 dfdaemon listener/discovery、connection admission、readiness 和 shutdown（已完成，
-  2026-08-28）；
-- [x] 接 `piece.rs` 的 normal/persistent/cache URMA + Storage finish 整体 TCP fallback
-  （已完成，2026-08-28）；
-- [ ] 用真实 provider 验证一次建 lane 后顺序传输至少 10 个 Piece，以及 mark-error flush/reap；
-- [ ] 增加 native failure injection，覆盖 runtime close retry、owner poison、flush batch 和 shutdown；
-- [ ] 在真实吞吐基线证明 memcpy 是瓶颈后，把 `ReceivedChunk` backing 换成注册窗口 guard。
+1. 实现 `client::urma` 的 Piece receive stream，把 session 返回的 owned windows 接到现有
+   downloader/digest/write contract；
+2. 实现 `server::urma` 的 Storage/RangeReader adapter，按 `next_window_len` 有界读取并发送；
+3. 接 dfdaemon listener/discovery、peer session cache、readiness、shutdown 和 TCP fallback；
+4. 用真实 provider 验证一次建 lane 后顺序传输至少 10 个 Piece，以及 mark-error flush/reap；
+5. 增加 native failure injection，覆盖 runtime close retry、owner poison、flush batch 和 shutdown；
+6. 在真实吞吐基线证明 memcpy 是瓶颈后，把 `ReceivedChunk` backing 换成注册窗口 guard。
 
 不在 `client::urma/server::urma` 的调用契约明确前增加 placeholder public API。

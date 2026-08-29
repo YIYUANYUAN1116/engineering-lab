@@ -1,6 +1,86 @@
 # Phase B：URMA production 性能数据路径
 
-更新时间：2026-08-28。
+更新时间：2026-08-29。
+
+## 0. 当前实施状态
+
+截至 2026-08-29，B1、B2、B3、B4 已完成代码实现和纯测试/编译验证；Phase B 新数据路径尚未进行
+真实 provider 跨节点验证，因此这里不把 B1-B4 标记为真机 PASS。
+
+### B1：registered window lease 基础已落地
+
+- registered Segment 的 CPU backing 可通过受边界约束的 span 访问，native handle 仍严格留在 owner
+  thread；没有把裸指针或 native object 无依据地声明为跨线程安全；
+- RX 使用只读 lease，TX 使用独占 direct-fill lease；pool/lease identity、slot generation 和
+  `user_ctx` generation 校验共同阻止 wrong-pool recycle、double recycle、迟到 CQE 和迟到 recycle
+  命中已复用 slot；
+- lease 显式 recycle 和 `Drop` 保底都只向 owner thread 发送 urgent command，不从 consumer thread
+  直接调用 native API；
+- close/shutdown 会检查 active lease；无法安全收敛时隔离 backing，不能先注销 Segment 后留下悬空
+  view；
+- 已覆盖 generation、tail span、direct fill、wrong pool、double recycle、active close、Drop urgent
+  recycle 和 `Send/Sync` 边界测试。
+
+### B2：registered RX completion 与双窗口预投递已落地
+
+- 一个逻辑 RX window 的全部 slot 会先原子保留，成功后才逐 WR post；预算不足返回可分类的
+  `BufferUnavailable`，不会留下半个 window 已 post 的状态；
+- CQ completion 直接归并为只读 `RegisteredRxWindowLease`，保留多 slot part、精确有效长度和尾
+  slot，不再生成 `ReceivedChunk(Vec<u8>)`；
+- Session 最多预投递两个 window。pipeline permit 从 pending、completed 一直持有到 consumer 释放
+  lease，第三个 window 不能越过背压；第二个 window 资源不足时安全退化为深度 1；
+- `RecvPosted` 只在完整 window post 成功后发送；lease 释放后由 owner recycle，后续 repost/credit
+  才能继续推进；现有 sequence/length/Done、整 Piece timeout、drop/error gate 保持不变；
+- transport-neutral `Downloader` 兼容入口仍会把完整 registered lease 聚合复制一次到 `Vec`，然后
+  显式 recycle；B3 production Piece 路径不再走这个兼容入口。
+
+### B3：Storage direct-write 与 digest overlap 已落地
+
+- `UrmaStreamReader`/`UrmaReceivedWindow` 把 immutable multi-span registered lease 交给 Storage，
+  `piece.rs` 不接触 Fabric、lane、slot 或 CQ 类型；
+- normal、persistent、persistent-cache 三类 Piece 均接入 URMA 专用 completion path；每个 window
+  直接 positional write，CRC32 与 write 在两个 blocking worker 上并行读取同一 lease；
+- 两个 worker 全部 join 后才显式 recycle；write/digest error 也先等待已提交工作收敛，drop/error
+  保底仍通过 owner urgent command 回收；
+- expected length 和 positional offset 使用硬边界/溢出检查，过长 window 不得覆盖后续 Piece，短流
+  也不会提交 metadata；
+- Storage/digest/transfer 失败继续按 Piece 类型 reset partial metadata，再从 TCP 整块重下；最终 window
+  仍在 Done 验证后才发布；
+- production RX 当前为 `NIC DMA -> registered spans -> pwrite/digest`，额外 userspace staging copy
+  为 0。只有通用 `Downloader` 兼容调用仍保留一次 lease -> `Bytes` copy。
+
+### B4：TX direct-fill、mmap 与双窗口 ring 已落地
+
+- server 不再创建 owned window，也不再逐 chunk `.to_vec()`；`MappedPiece` 或 `RangeReader` 直接填充
+  exclusive `TxWindowLease` 的逐 slot span，生产路径已删除普通 Vec -> registered Segment copy API；
+- 一个逻辑 window 固定为一个 message 对应一个 TX slot。即使协商 chunk 小于 slot size，也不会让多个
+  outstanding SEND 共享同一个 slot/user_ctx；尾 window 可在不增长 lease 的前提下缩短 span 和 chunk 数；
+- `CompletionRouter` 为整窗建立共享 completion state；每个 SEND CQE 只把自己的 slot 从
+  `SendPosted` 恢复为 `LeasedTx`，全部 CQE 完成后才把 exclusive lease 返回 Session，错误/timeout 时也
+  不会在 provider 仍引用 slot 时 recycle；
+- server 使用两个独立 lease 实现 ring：`send(current)` 与 `fill(next)` 并行；第二个 lease 因 TX pool
+  压力或有界等待超时时退化为 ring=1，单窗必须等全部 CQE 后才 refill；
+- fixed TX pool 默认 128 slots，协商 SEND window 进一步限到半池容量，默认最多 64 chunks，为第二个
+  lease 保留形成 ring 的空间；这只是 B4 的固定池限界，不替代 B6 的多 peer fairness/shared overflow；
+- 新增 `storage.server.urma.mmapContent`，启用后 normal/persistent/persistent-cache 完成态 Piece 均先尝试
+  `map_upload_piece`；cache-resident 或 mmap 失败仍走原有 upload `RangeReader`；
+- TX 当前为 `mmap/RangeReader -> registered TX spans -> NIC DMA`，只保留一次必要 source-fill copy。
+
+当前验证结果：
+
+```text
+cargo fmt --all -- --check                                      PASS
+cargo check -p dragonfly-client-storage                         PASS
+cargo check -p dragonfly-client --features urma                 PASS
+cargo test -p dragonfly-client-storage --features urma urma::   43 passed / 0 failed
+cargo test -p dragonfly-client-storage --features urma test_write_urma_stream
+                                                                  2 passed / 0 failed
+cargo test -p dragonfly-client-storage --features urma --lib    155 passed / 0 failed
+cargo test -p dragonfly-client --features urma --lib            62 passed / 0 failed
+```
+
+上述 URMA 测试使用本地 UMDK build tree，未启动真实 provider。下一阶段进入 B5 post/CQ/credit
+批处理；B1-B4 仍需按 B7/runbook 补真实跨节点验证。
 
 ## 1. 结论与范围
 
@@ -41,7 +121,7 @@ RDMA 当前的 mmap 上传也仍需把 mmap 内容复制到 registered send wind
 误称为 TX zero-copy。直接注册文件映射、URMA READ/WRITE、remote Segment 和 UBS Memory 不属于
 本阶段承诺，除非后续数据证明上述 SEND/RECV 路径仍无法达到目标。
 
-## 2. 当前 Phase A 基线
+## 2. Phase A 历史基线与当前过渡状态
 
 ### 2.1 下载路径存在两次 staging copy
 
@@ -58,6 +138,14 @@ provider DMA
 `[源码确认]` copy 1 位于 `urma/buffer.rs::complete_recv`，copy 2 位于
 `urma/session.rs::receive_next_window`。当前设计易于保证 slot 及时回收和 Rust ownership，但会增加
 内存带宽、allocator 和大 Piece CPU 成本。
+
+`[B2 已实现]` 上述 `SegmentHandle::read -> ReceivedChunk(Vec)` 路径已经删除。CQ 现在发布
+`RegisteredRxWindowLease`；兼容 `PieceContentStream` 的入口只在完整 window 上做一次聚合 copy，随后
+显式 recycle lease。
+
+`[B3 已实现]` Dragonfly production Piece 路径现在取得 `UrmaStreamReader`，Storage 直接遍历 lease 的
+registered spans 做 positional write 和 CRC32，不再经过兼容 `PieceContentStream`，因此 production
+RX 已达到 0 次额外 userspace staging copy。兼容 copy 只为 transport-neutral trait 调用保留。
 
 ### 2.2 上传路径也存在两次 staging copy
 
@@ -111,6 +199,54 @@ demo 的真实 provider 结果证明了这些机制组合有价值，但不能�
 
 `[实验确认]` 最后一项尤其说明 mmap 本身不会消除 registered TX source-fill；Phase B 必须同时做
 双窗口 overlap 和 source-fill 指标，不能只增加 WR 深度。
+
+### 3.1 URMA slot pool 是否对齐 RDMA buffer pool
+
+`[设计决定，2026-08-29]` 当前不把 URMA fixed slot pool 重写成 RDMA best-fit `PooledBuf`。两者需要
+对齐 production 能力与资源语义，不要求对齐 allocator 结构。
+
+当前模型差异：
+
+| 维度 | RDMA | URMA |
+|---|---|---|
+| 注册方式 | 按需分配/注册 `PinnedBuf`，完成后进入 best-fit cache | Runtime 启动时注册一个连续 Segment |
+| 分配粒度 | 任意 logical length，复用最小可容纳 buffer | 固定 slot；当前默认 64 KiB |
+| 预算 | `max_registered_bytes` 共享 byte budget，支持 wait/try-acquire | 固定 TX/RX slot 数；当前默认 TX 128、RX 512，共 40 MiB |
+| window 布局 | 通常一个连续 `PooledBuf` | 多 slot 组成 multi-span logical window |
+| 回收 | 最后一个 operation/reader owner 释放后直接返回本地 pool | consumer 通过 urgent owner command 校验 lease/generation 后回收 |
+| 资源不足 | 等待预算或 non-blocking 失败 | `BufferUnavailable`；第二 window 安全退化为 pipeline depth 1 |
+
+URMA 必须补齐、但不要求照搬 RDMA 类型的能力：
+
+- process 级 registered-byte ceiling，active + idle/预留内存都计入；
+- 已持有一个 window 时，第二 window 只能 non-blocking acquire，禁止并发死锁；
+- 多 peer admission/fairness，以及 TX/RX 最小保留和共享 overflow 策略；
+- slot/byte active、idle、等待、分配失败、双窗口降级和 owner recycle latency 指标；
+- active lease、outstanding WR 与 Segment shutdown 的可审计生命周期。
+
+只有真实 workload 出现以下证据时，才升级 allocator：
+
+1. 一侧 slot 耗尽并频繁 `BufferUnavailable`，另一侧 TX/RX slots 或 registered bytes 长期空闲；
+2. negotiated chunk 明显小于 slot size，导致有效 payload/registered bytes 比例过低；
+3. multi-span 数使 WR/CQE、CRC slice 遍历、`pwrite` syscall 或 owner recycle queue 成为 CPU 瓶颈；
+4. 双窗口经常退化为单窗口，但并非 Storage consumer 慢或 registered-byte ceiling 确实耗尽；
+5. Piece/window/message size 分布很散，单一 slot size 无法同时满足内存利用率和 WR 数；
+6. 启动时固定 pin 内存违反容器 memlock、低流量节点成本或多 device/runtime 扩展要求。
+
+出现上述证据后的优先演进顺序是：
+
+```text
+post/CQ/pwritev batching
+-> 调整 slot size
+-> TX/RX reserved minimum + shared overflow
+-> 多 size-class slot/slab
+-> 可增长/可回收的 multi-Segment arena
+-> 最后才评估完整 best-fit variable buffer pool
+```
+
+如果双窗口稳定、slot 利用率高、TX/RX 没有单边闲置、owner queue 不是瓶颈且 pinned memory 可接受，
+fixed slot pool 更简单且热路径没有 MR registration miss，应继续保留。B4/B5 先在现有 slot 模型上完成；
+B6 根据上述指标决定是否演进 allocator，不能为了与 RDMA 内部同形而提前重写。
 
 ## 4. 目标架构
 
@@ -180,6 +316,8 @@ Window A:                 refill A
 
 ### B1：registered window lease 基础
 
+`[状态：代码完成，真机待验]`
+
 1. 将 registered backing 的生命周期与 slot allocator 状态解耦，提供只读 RX lease 和独占 TX lease。
 2. 明确 backing 是否可安全跨 owner/Tokio thread 读取；以 UMDK ABI/provider 要求验证 `Send/Sync`，
    不直接给 raw pointer 添加无依据的 unsafe trait。
@@ -192,6 +330,8 @@ Window A:                 refill A
 
 ### B2：RX direct window 与双窗口预投递
 
+`[状态：lease/completion/pipeline 代码完成，真机待验]`
+
 1. Fabric 支持把一个连续/逻辑连续 RX window 的多个 slot 作为一个 lease 发布。
 2. Session 将 `receive_next_window -> Vec<u8>` 改为 receive window reader/stream。
 3. 同时预投递最多两个 window，并允许提前发送两个 `RecvPosted`；深度受 Jetty recv depth、RX slot
@@ -199,9 +339,13 @@ Window A:                 refill A
 4. receive credit 只在 Storage 释放 lease且 slot 确实 repost 后返回。
 5. 保留 sequence/length/Done、整 Piece timeout、consumer drop 和 peer error 语义。
 
-完成后应消除 RX slot -> `ReceivedChunk(Vec)` 和 chunk Vec -> aggregate window 两次 copy。
+B2 消除了 RX slot -> `ReceivedChunk(Vec)` 和 chunk Vec -> aggregate window 的旧两段式路径；在 B2
+完成时兼容 adapter 仍有一次 lease -> aggregate window copy。B3 已使 production Piece 路径绕过该
+兼容 copy；仅 transport-neutral trait 调用仍保留它。
 
 ### B3：Storage direct-write 与 digest overlap
+
+`[状态：代码完成，纯测试/编译通过，真机待验]`
 
 1. 增加 `download_piece_from_parent_finished_urma`，接口形态与 RDMA 专用 completion path 对齐。
 2. 每个 registered window 直接 positional write 到目标 Piece range，不经过 generic stream staging。
@@ -211,6 +355,8 @@ Window A:                 refill A
 6. normal/persistent/persistent-cache 三条路径保持相同失败重置和 TCP 整块重下语义。
 
 ### B4：TX direct-fill、mmap 与双窗口 ring
+
+`[状态：代码完成，纯测试/编译通过，真机待验]`
 
 1. server 从 BufferPool 获取 `TxWindowLease`，Storage source 直接填充 lease。
 2. 删除 production 数据路径上的 per-chunk `.to_vec()` 和普通 Vec -> registered slot write。
@@ -279,8 +425,9 @@ Phase B 只有同时满足以下条件才完成：
 - 未验证的 raw pointer 跨线程、CQE 前复用 TX、lease 释放前 repost RX；
 - 将 URMA READ/WRITE、remote Segment 或 UBS Memory作为 Phase B 前置条件。
 
-## 8. 建议实施起点
+## 8. 下一实施点
 
-第一轮从 B1 开始：先完成 registered RX/TX window lease 的生命周期设计和纯测试，再接 B2 下载路径。
-这是后续 RX zero-copy、TX 双 ring、Storage direct-write 和 batch post 的共同基础，也是最不适合在后期
-返工的部分。Phase A 的现有 adapter 在 B1 期间继续工作，直到 B2/B3 端到端替换完成。
+B1-B4 已形成完整 RX/TX production copy-count 路径：RX direct positional write/digest，TX direct-fill、
+mmap/RangeReader fallback 和双 lease overlap。下一轮进入 B5 post/CQ/credit 批处理；同时保留
+B1-B4 的真实 provider correctness、尾 window、连续 Piece、故障和 outstanding shutdown 验证债务，
+不得把纯测试结果当作真机性能结论。

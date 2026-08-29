@@ -1,6 +1,6 @@
 # RDMA/URMA 上传下载路径对比与进度台账
 
-更新时间：2026-08-28。
+更新时间：2026-08-29。
 
 ## 1. 结论
 
@@ -18,21 +18,16 @@
 - URMA/liburma：process-level Runtime/JFC/Segment，per-peer RC Jetty；一个 TCP control connection
   和 Jetty 顺序复用多个 Piece。
 
-URMA 当前已完成 native/Fabric/lane/session，以及 client 侧下载 adapter（`client::urma`）与
-`URMADownloader` 注册到 `DownloaderFactory`（discovery 缓存、penalty/backoff、fabric 懒初始化、
-per-parent Session 复用、失败退休）。server 侧 listener/admission/readiness、dfdaemon optional
-task 和 TCP `DFUR` discovery 已接入。`piece.rs` 已通过通用 `Downloader` 边界接入
-normal/persistent/persistent-cache 三条 production path：URMA 建连/首读失败直接回退
-TCP，URMA stream 开始后的传输或 Storage finish 失败会先重置 partial Piece，再整块
-TCP 重下。现有 adapter
-应复用 Dragonfly 的 Storage、Downloader、限流、metrics 和 TCP fallback，不复制 demo 的文件传输
-或 benchmark 结构。
+URMA 已完成 native/Fabric/lane/session、client/server adapter、discovery/readiness、dfdaemon wiring、
+三类 Piece fallback，以及 Phase B B1-B4 RX/TX production 数据路径。demo 只提供已验证的 URMA
+provider/WR/lease 实现依据；Dragonfly 没有迁移 demo 的独立文件协议、benchmark CLI 或 application
+结构。
 
-接口对齐只发生在业务边界：两者都通过 `Downloader::download_*` 返回
-`PieceContentStream + offset + digest`，server 都提供 optional `run`/readiness/discovery 语义。
-RDMA `acquire_buffer`/`PooledBuf`、tagged post/CQ 与 URMA fixed slot、Jetty credit/owner-thread command
-属于各自 transport-private 实现，不要求同名同参，也不得暴露给 `piece.rs`。URMA 已将
-`RuntimeConfig`、`UrmaLaneConfig`、`UrmaServerHandler` 和 registry mutation 收回 storage 内部。
+当前 production RX 是 `NIC DMA -> registered RX spans -> positional write + CRC32 -> recycle`，没有
+额外 userspace staging copy。transport-neutral `Downloader` 兼容调用仍保留一次 lease -> `Bytes`
+聚合 copy，但 `piece.rs` 的三类 production 路径不走该入口。当前 production TX 是
+`MappedPiece/RangeReader -> registered TX spans -> NIC DMA`，没有 owned window 或逐 chunk payload
+copy。B1-B4 尚未进行真实 provider 跨节点验证。
 
 ## 2. 下载路径
 
@@ -53,20 +48,41 @@ Piece::download_piece_from_parent
 
 | 链路阶段 | RDMA production path | URMA 当前对应 | 状态 |
 |---|---|---|---|
-| Piece 协议选择和 TCP fallback | `resource/piece.rs` | 三类 Piece 均通过 `Arc<dyn Downloader>` 选择 URMA，并保留 TCP 地址 | 已完成（真机待验） |
+| Piece 协议选择和 TCP fallback | `resource/piece.rs` | 三类 Piece 优先走 URMA direct reader；失败 reset 后 TCP 整块重下 | 已完成，真机待验 |
 | capability discovery/cache/backoff | `RDMADownloader` + `discover` | `URMADownloader` + `discover` | 已完成 |
-| process fabric 初始化/失败退休 | `RDMADownloader::fabric` | `URMADownloader::fabric` + `UrmaFabric::start/shutdown/readiness` | 已完成（懒初始化/失败退休/掉线重连） |
-| peer connection | 每 Piece TCP rendezvous | `URMADownloader` 缓存 `UrmaClient`，单 Session slot 串行复用 lane | 已完成（真机复用待验） |
+| process fabric 初始化/失败退休 | `RDMADownloader::fabric` | `URMADownloader::fabric` + `UrmaFabric::get_or_start` | 已完成 |
+| peer connection | 每 Piece TCP rendezvous | per-parent cached client、persistent Session/lane | Phase A normal 真机已确认复用 |
 | Request/Ready 协商 | `RDMAClient::handle_download` | `request_piece` | 已对齐 |
-| post receive + receive-ready | `receive_stream` + `RecvPosted` | `receive_next_window` + `RecvPosted` | 已对齐 |
-| operation completion 校验 | tag/chunk/length | lane/sequence/length | 已对齐 |
-| 内容向上交付 | `RDMAStreamReader`/`PieceContentStream` | `client::urma` 投递 owned `Bytes` window | 已完成 |
-| Storage 写入和 digest | 通用 stream；另有 RDMA direct-window 优化 | 通用 stream（Storage 消费 `PieceContentStream`） | 已完成（Copy-RX） |
-| stream drop/timeout/fallback | retire endpoint/session，TCP 重下 | 最终 window 受 Done gate；整 Piece timeout；延迟失败退休 Session；Storage 失败后 reset + 整块 TCP 重下 | 已完成（故障注入/真机待验） |
+| post receive + receive-ready | `receive_stream` + `RecvPosted` | 原子保留完整 window；最多预投递 2 个；完整 post 后 `RecvPosted` | B2 完成，真机待验 |
+| operation completion 校验 | tag/chunk/length | lane/sequence/length + slot generation | B1/B2 完成，真机待验 |
+| 内容向上交付 | `RDMAStreamReader`/`ReceivedWindow` | `UrmaStreamReader`/multi-span `UrmaReceivedWindow` | B3 完成 |
+| Storage 写入和 digest | registered window direct write/hash | immutable spans 上 positional write 与 CRC32 并行 | B3 完成，真机待验 |
+| stream drop/timeout/fallback | retire endpoint/session，TCP 重下 | Done gate、per-window/整 Piece timeout、owner recycle、partial reset | 已完成，真机待验 |
 
-Phase A 的 URMA adapter 使用 owned window -> `Bytes` -> bounded `PieceContentStream`。RDMA 的
-registered-window direct `pwrite + digest` 不作为 URMA 首次接入门槛，但已确定为
-[Phase B production 性能数据路径](./phase-b-performance-data-path.md) 的必做项。
+Phase A 的两段式 RX staging 和 B2 过渡期的一次 aggregate copy 已从 production Piece 路径移除。
+B3 write/hash 共享 immutable lease，两个 blocking worker 都 join 后才显式 recycle；expected length、
+累计 length 和 positional offset 有硬边界。兼容 `Downloader` trait 保留一次 copy，不代表 production
+RX 数据路径。
+
+### 2.3 Buffer 管理模型与对齐边界
+
+RDMA 当前是受 byte semaphore 限界的动态 best-fit registered buffer cache；URMA 当前是一个预注册
+Segment 上的固定 TX/RX slot pool。前者对不同尺寸和方向更灵活，后者没有热路径 registration miss、
+状态更确定，但可能产生固定分区闲置、slot 内部碎片、multi-span syscall 和 owner recycle queue 开销。
+
+当前决定是不照搬 RDMA allocator，只对齐以下能力：全局 registered-byte budget、non-blocking 第二
+window acquire、多 peer fairness、TX/RX shared overflow、生命周期安全和完整指标。B4/B5 继续使用
+fixed slots；B6 只有在真机观察到以下信号后才选择 multi-size/shared arena 或 best-fit 演进：
+
+- TX/RX 一侧耗尽而另一侧长期空闲；
+- payload/registered bytes 利用率低；
+- `BufferUnavailable` 或 pipeline depth 1 降级频繁；
+- WR/CQE、逐 span write、CRC 遍历或 owner recycle latency 限制 CPU/吞吐；
+- 固定 pin 内存不满足 memlock、容器或多 device 约束。
+
+优先先做 batching、调 slot size、TX/RX shared overflow 和多 size-class；完整动态 best-fit pool 是最后
+选项。详细决策与触发条件见
+[Phase B production 性能数据路径](./phase-b-performance-data-path.md#31-urma-slot-pool-是否对齐-rdma-buffer-pool)。
 
 ## 3. 上传路径
 
@@ -79,9 +95,10 @@ dfdaemon UrmaServer task
   -> loop receive_request
        -> Storage::get_piece/get_persistent_*
        -> upload bandwidth limiter + started metric
-       -> Storage::upload_* -> io::RangeReader
+       -> optional MappedPiece / Storage::upload_* RangeReader
        -> ready(metadata)
-       -> loop next_window_len -> read_exact -> send_next_window
+       -> direct-fill TxWindowLease A
+       -> loop send(current) || fill(next)，预算不足时 ring=1
        -> finish_piece + finished/traffic metric
 ```
 
@@ -89,22 +106,24 @@ dfdaemon UrmaServer task
 
 | 链路阶段 | RDMA production path | URMA 当前对应 | 状态 |
 |---|---|---|---|
-| dfdaemon server task | `RDMAServer::run` | `UrmaServer::run` optional task | 已完成 |
-| listener/readiness | TCP listener + `CapabilityRegistry` | listener + live `CapabilityRegistry` + `DFUR` discovery | 已完成 |
-| connection/transfer admission | semaphore | connection semaphore + Fabric command admission | 已完成（BUSY typed reply） |
+| dfdaemon server task | `RDMAServer::run` | optional `UrmaServer::run` task | 已完成 |
+| listener/readiness | TCP listener + `CapabilityRegistry` | listener + live registry + `DFUR` discovery | 已完成 |
+| connection/transfer admission | semaphore | connection semaphore + Fabric command admission | 已完成 |
 | peer transport 建立 | 共享 endpoint + per-Piece request | `UrmaServerSession::accept` + bind Jetty | 已有 |
 | Piece 请求 | handler 读 Request | `receive_request` | 已有 |
-| metadata lookup | `Storage::get_*` | `UrmaServerHandler::piece_metadata`，覆盖三类 Piece | 已完成 |
-| not-found/busy/internal reply | RDMA `abort(Error frame)` | handler + `reject_piece(code, message)` | 已完成（BUSY 等 listener admission） |
-| bandwidth limiter/metrics | 已有 | handler upload limiter + started/finished/failure/traffic | 已完成 |
-| Storage 数据源 | `open_piece_source`/`RangeReader`/optional mmap | `upload_* -> RangeReader -> bounded owned window` | 已完成（不做 mmap） |
-| receive-ready + SEND/completion | handler + Fabric | `send_next_window` + Fabric | 已对齐 |
+| metadata lookup | `Storage::get_*` | `UrmaServerHandler`，覆盖三类 Piece | 已完成 |
+| not-found/busy/internal reply | RDMA `abort(Error frame)` | typed handler/reply | 已完成 |
+| bandwidth limiter/metrics | 已有 | server adapter limiter/metrics | 已完成 |
+| Storage 数据源 | `open_piece_source`/`RangeReader`/optional mmap | `MappedPiece` 优先（配置开启）+ cache/mmap failure `RangeReader` fallback，直接填 TX lease | B4 完成，真机待验 |
+| receive-ready + SEND/completion | registered ring + per-op completion | `send_next_registered_window`；整窗 CQE state 持有 lease | B4 完成，真机待验 |
+| fill/SEND overlap | 两半 registered ring | 两个 exclusive lease；`send(current)` 与 `fill(next)` 并行，资源不足 ring=1 | B4 完成，真机待验 |
 | Piece Done | Done 后连接结束 | `finish_piece` 后 session 回 Idle | 已对齐；持久复用 |
-| server shutdown/drain | task shutdown + Fabric close | clear advertisement -> close listener -> abort/drain lanes -> Fabric shutdown | 已完成（真机待验） |
+| server shutdown/drain | task shutdown + Fabric close | advertisement clear -> listener close -> lane/Fabric drain | 基础 wiring 完成，真机待验 |
 
-Phase A 只使用 `RangeReader::read_exact` 填充一个 owned window。RDMA 的 mmap、双 registered send
-ring、Storage read 与 NIC send overlap 已纳入
-[Phase B production 性能数据路径](./phase-b-performance-data-path.md)，不再作为未定的可选优化。
+B4 已移除 TX owned window、per-chunk `.to_vec()` 和 shim Segment copy。每个 negotiated message 独占
+一个 slot，即使 chunk 小于固定 slot 也可同时 outstanding；最后一个 CQE 前 lease 不会返回/refill。
+默认 128 个 TX slots 将协商 window 限到半池 64 chunks，为第二 lease 留出空间；这不解决多 peer
+fairness，B6 仍按第 2.3 节的证据门槛决定 shared overflow/size class/动态 pool。
 
 ## 4. Session production contract
 
@@ -112,14 +131,20 @@ ring、Storage read 与 NIC send overlap 已纳入
 
 - peer `Error` 不再压成普通 protocol string；`PeerRejected { code, message }` 保留
   incompatible/not-found/busy/internal，供 downloader fallback/backoff 决策；
-- active Piece 的 TCP control read/write 受 `control_timeout` 约束，超时返回带 operation 名称的
-  `ControlTimeout` 并 retire 当前 lane；空闲等待下一 Piece 使用独立 Session idle timeout，正常到期
-  close lane，不分类为 transport error；
+- active Piece 的 TCP control I/O 使用 `control_timeout`；空闲 Session 使用独立 idle timeout；
 - `request_piece` 和 `receive_request` 返回 owned metadata/request，避免 adapter 在后续可变 Session
   调用前持有借用；
 - `UrmaServerSession::reject_piece` 可向 peer 返回明确错误并终止当前保守型 Phase A session；
 - negotiated `max_inflight_chunks` 不得超过 client local Jetty `recv_depth` 或 server local Jetty
   `send_depth`。
+
+B2/B3 又增加以下 RX contract：
+
+- logical window 的全部 slots 必须在任何 WR post 前原子保留；
+- pipeline depth 最大为 2，permit 覆盖 pending、completed 和 consumer-held lease；
+- 第二个 window 预算不足安全退化为深度 1；
+- 完整 window post 成功后才能发送 `RecvPosted`；write/hash 完成并 recycle 后才释放真实预算；
+- final lease 仍在 Done 校验后发布；blocking write 错误路径先 join 已提交 worker，再 reset/fallback。
 
 尚未放入 Session 的职责：
 
@@ -136,33 +161,28 @@ ring、Storage read 与 NIC send overlap 已纳入
 |---|---|---|
 | native Runtime/JFC/JFR/Segment/Jetty ownership | 已完成（纯测试/编译） | 真实 provider startup/shutdown |
 | per-operation completion、timeout、drain/reap | 已完成（纯测试/编译） | 真机 CQE/flush |
-| persistent lane + sequential Piece Session | 1 GiB 真机确认 client/server 各建立 1 lane、1 次 `reused=false`、255 次 `reused=true`；已修复并发 singleflight 和 30s active timeout 误杀 idle Session（storage 34/client 62 tests） | 等待 40s 跨任务复用；超过 450s 正常 idle close 后无 fallback 重连 |
+| persistent lane + sequential Piece Session | Phase A 1 GiB 真机确认双方各 1 lane，`reused=false` 1 次、`true` 255 次 | 跨任务 idle 复用/正常 idle close |
 | Session production contract | 已完成 | adapter error/fallback 测试 |
-| `client::urma` + `PieceContentStream` | 已完成（含 Done gate/整 Piece timeout）；1 GiB + 12,345 bytes 真机下载及 SHA-256 已通过 | persistent/cache Piece 双端 |
-| `URMADownloader` 接入 `DownloaderFactory` | 已完成 | 真机 discovery/fallback 决策 |
-| config `UrmaServer`（dfdaemon） | 已完成 | example YAML + 运行验证 |
-| `server::urma` + Storage/RangeReader | normal Piece 真机通过，含 4 MiB/64 KiB 均不能整除的 12,345-byte 尾部 | persistent/cache、not-found、限流真机验证 |
-| dfdaemon server wiring（listener/readiness） | 已完成（纯测试/编译） | optional capability 真机验证 |
-| `piece.rs` 整体 fallback | 已完成（normal/persistent/cache）；建连/请求前失败、三类流中断、digest mismatch、Storage timeout 已有故障注入测试 | 真机断链与 TCP 重下 |
-| metrics/shutdown orchestration | 已完成基础 wiring | 真机 outstanding WR shutdown |
-| registered lease、RX direct-write、双 window、mmap、post/CQ batch | Phase B 已规划，待实现 | 按 B1-B7 顺序完成；真实 provider correctness 后做最终同口径 benchmark |
+| `client::urma`/`URMADownloader`/server wiring | 已完成；Phase A 1 GiB + 12,345 bytes normal 真机通过 | persistent/cache、断链、not-found、限流真机 |
+| 三类 Piece fallback | 代码完成，6 场景 matrix 通过 | 真机 partial reset + TCP 重下 |
+| registered lease/generation/owner recycle/close guard（B1） | 代码和纯测试完成 | 真机 recycle/active-close/outstanding shutdown |
+| registered completion/atomic reservation/双窗口（B2） | 代码和纯测试完成 | 真机连续 Piece、背压、drop、尾 window |
+| Storage direct-write + digest overlap（B3） | 三类 Piece 代码和纯测试完成；production RX 0 staging-copy | 真机 correctness、故障与 overlap 指标 |
+| TX direct-fill/双 ring/mmap（B4） | 代码和纯测试完成；production TX 1 次 source-fill copy | 真机 mmap/reader/tail/ring=1/2/CQE ownership |
+| post/CQ/credit batch（B5） | 待实现 | partial post/CQ/error 路由与性能校准 |
 
 当前验证：
 
 ```text
 cargo fmt --all -- --check                                    PASS
+cargo check -p dragonfly-client-storage                       PASS
 cargo check -p dragonfly-client --features urma                PASS
-cargo test -p dragonfly-client-storage --features urma urma::  34 passed / 0 failed
-cargo test ... discovery_is_fail_closed_until_listener_publishes  1 passed / 0 failed
-cargo test -p dragonfly-client --features urma --lib           62 passed / 0 failed（含 URMA singleflight/退避/fallback）
-cargo test -p dragonfly-client --features urma --lib resource::piece::tests::test_urma_fallback_matrix
-                                                               1 passed / 0 failed（6 场景）
-cargo test -p dragonfly-client-config                          47 passed / 0 failed
+cargo test -p dragonfly-client-storage --features urma urma::  43 passed / 0 failed
+cargo test -p dragonfly-client-storage --features urma test_write_urma_stream
+                                                               2 passed / 0 failed
+cargo test -p dragonfly-client-storage --features urma --lib  155 passed / 0 failed
+cargo test -p dragonfly-client --features urma --lib           62 passed / 0 failed
 ```
 
-说明：
-- `rdma` feature 的 `cargo check` 需要 libfabric 头文件（`rdma_fabric.h`），本机仅有运行时
-  `libfabric.so.1`、缺 dev 包，因此 `--features rdma,urma` 联合编译未在本机验证；
-- 链接/运行 `urma` 相关测试需要 `LD_LIBRARY_PATH`/`-rpath-link` 指向 UMDK core 与 common 的
-  build 目录（`liburma.so` 传递依赖 `liburma_common.so`）；
-- 上述验证使用本地 UMDK build tree，未启动真实 provider。
+说明：client 全量测试的本地 scheduler socket 用例在沙箱外运行并 62/62 通过；URMA 使用本地 UMDK
+build tree。B1-B4 未启动真实 provider，不能据此宣称跨节点 correctness 或性能 PASS。
