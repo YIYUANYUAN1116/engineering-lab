@@ -4,8 +4,10 @@
 
 ## 0. 当前实施状态
 
-截至 2026-08-29，B1、B2、B3、B4 已完成代码实现和纯测试/编译验证；Phase B 新数据路径尚未进行
-真实 provider 跨节点验证，因此这里不把 B1-B4 标记为真机 PASS。
+截至 2026-08-29，B1、B2、B3、B4 已完成代码实现和纯测试/编译验证；同日完成
+首次真实 provider 跨节点验证，B4 mmap direct-fill TX 生产路径 correctness
+PASS（见 0.1）。除此之外 Phase B 新数据路径的其余真机验证项（B2/B3 RX 路径、
+ring=2 overlap、fault/shutdown 等）尚未执行，因此 B1-B4 不整体标记为真机 PASS。
 
 ### B1：registered window lease 基础已落地
 
@@ -51,6 +53,8 @@
 
 ### B4：TX direct-fill、mmap 与双窗口 ring 已落地
 
+`[状态：代码完成，纯测试/编译通过；mmap 生产路径与 ring=2 send∥fill overlap 真机 correctness PASS（2026-08-29，见 0.1/0.2），ring=1 退化注入/持久类 Piece 场景真机待验]`
+
 - server 不再创建 owned window，也不再逐 chunk `.to_vec()`；`MappedPiece` 或 `RangeReader` 直接填充
   exclusive `TxWindowLease` 的逐 slot span，生产路径已删除普通 Vec -> registered Segment copy API；
 - 一个逻辑 window 固定为一个 message 对应一个 TX slot。即使协商 chunk 小于 slot size，也不会让多个
@@ -79,8 +83,76 @@ cargo test -p dragonfly-client-storage --features urma --lib    155 passed / 0 f
 cargo test -p dragonfly-client --features urma --lib            62 passed / 0 failed
 ```
 
-上述 URMA 测试使用本地 UMDK build tree，未启动真实 provider。下一阶段进入 B5 post/CQ/credit
-批处理；B1-B4 仍需按 B7/runbook 补真实跨节点验证。
+上述 URMA 测试使用本地 UMDK build tree，未启动真实 provider。
+
+### 0.1 B4 真机验证记录（2026-08-29，node1 parent / node2 child）
+
+首次真实 provider 跨节点验证：B4 mmap direct-fill TX 生产路径 correctness PASS。
+
+- 场景：1 GiB 任务经 URMA 从 parent（node1）下载到 child（node2），
+  parent 开启 `storage.server.urma.mmapContent`；
+- mmap 命中：初始并发 8 个 Piece（0-7）全部输出
+  `URMA upload using mmap content`（server/urma.rs），grep 全程无
+  `URMA mmap unavailable; falling back to reader`，即 mmap direct-fill
+  命中率 8/8、reader fallback 为 0；
+- lane 复用：全部请求来自同一 `remote_address`（90.91.177.157:45222），
+  persistent lane 顺序复用，符合 B4 设计；
+- 内容一致性：source（/var/www/dragonfly/input-1g.bin）、parent 侧输出
+  （/tmp/parent-b4-mmap1.bin）、child 侧输出（/tmp/child-b4-mmap1.bin）
+  三端 SHA-256 均为
+  `49bc20df15e412a64472421e13fe86ff1c5165e18b2afccf160d4dc19fe68a14`；
+- 同日落地配套观测：
+  - 修复连接级 `#[instrument]` span 的 `task_id`/`piece_id` 字段随
+    `record()` 逐 Piece 累积导致日志行膨胀的问题；改为每 Piece 独立
+    `info_span!("urma_piece", task_id, piece_id)`；
+  - finished 日志新增 TX ring 观测字段：`tx_source`（mmap|reader）、
+    `tx_windows`、`tx_ring_depth`（仅当存在 send∥fill 重叠才记 2）、
+    `tx_overlap_windows`、`tx_second_lease_fallback`、`tx_fill_ns`、
+    `tx_send_wait_ns`；
+- 结构性发现：默认参数下 Piece=4 MiB 且窗口=64 chunks×64 KiB=4 MiB，
+  每个 Piece 恰为单窗口，`tx_windows=1`，双 ring 结构性不会触发。真机
+  验证 ring=2 需 Piece 长度大于 TX 窗口（如调小 `maxInflightChunks` 至
+  8 使窗口为 512 KiB，4 MiB Piece 共 8 个窗口）；
+- 本轮仍未覆盖（保持 B7 债务）：ring=2/overlap 真机证明（依赖上述参数
+  调整）、ring=1 退化注入、persistent/persistent-cache Piece mmap 场景、
+  fault/shutdown、B2/B3 RX 路径真机 correctness、吞吐与 copy 口径的
+  B7 同口径测量。
+
+结论修订：B4 mmap 生产路径的真机 correctness 已可标记 PASS；B1-B4 整体
+不据此整体标记真机 PASS，其余验证项仍按 B7/runbook 执行。下一实施点仍是
+B5 post/CQ/credit 批处理。
+
+### 0.2 B4 双 ring（ring=2）真机验证记录（2026-08-29，node1 parent / node2 child）
+
+按 0.1 的结构性发现调整参数（减小 TX 窗口使 Piece 多窗口化）后，双 ring
+真机验证 PASS。
+
+- 场景：1 GiB 任务，parent 开启 `mmapContent`，TX 窗口缩为 8 chunks，
+  4 MiB Piece 分 8 个窗口，双 ring 结构性生效；
+- ring 深度：多个 Piece 的 finished 日志一致显示
+  `tx_windows=8 tx_ring_depth=2 tx_overlap_windows=7
+  tx_second_lease_fallback=false`——8 个窗口中 7 个发生 send∥fill
+  重叠（最后一个窗口无 next 可填，结构性少 1），零退化；
+- 第二个 lease 获取：每个多窗口 Piece 均输出
+  `URMA TX double ring enabled tx_ring_depth=2 window_chunks=8`，
+  全程无 `URMA TX second lease unavailable`；
+- overlap 有效性：`tx_fill_ns≈0.69ms` 远小于
+  `tx_send_wait_ns≈2.37ms`，即 send 等待 CQE 期间 fill(next) 已完成，
+  TX 数据填充被完全隐藏在发送等待内，符合 ring 设计预期；
+- mmap：本轮 Piece 全部命中 `URMA upload using mmap content`；
+- 内容一致性：source（/var/www/dragonfly/input-1g.bin）与 parent 侧输出
+  （/tmp/parent-b4-ring2-1.bin）SHA-256 均为
+  `49bc20df15e412a64472421e13fe86ff1c5165e18b2afccf160d4dc19fe68a14`，
+  与 0.1 的 child 端基准一致；node2 侧错误审计
+  （fallback/cqe/completion/digest/protocol/generation/double recycle/
+  wrong-pool/transfer failed）grep 全部为空；
+- span 修复生效：日志行只包含单个 `piece_id`/`remote_address`，无字段
+  累积。
+
+结论修订：B4 的 ring=2 send∥fill overlap 真机 correctness PASS。
+B4 剩余真机债务：ring=1 退化注入（second lease 强制失败场景）、
+persistent/persistent-cache Piece mmap 场景、fault/shutdown、
+B2/B3 RX 路径真机 correctness、B7 同口径吞吐测量。
 
 ## 1. 结论与范围
 
