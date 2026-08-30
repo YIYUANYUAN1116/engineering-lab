@@ -495,7 +495,7 @@ client/dragonfly-client-storage/src/server/urma.rs
 | TCP server discovery 分支 | 识别独立 URMA discriminator并返回 URMA advertisement |
 | docs/tests/config examples | 增加 feature、运行依赖、配置和真实 provider 验证说明 |
 
-### 9.3 配置草案
+### 9.3 当前配置示例（B6 更新）
 
 ```yaml
 storage:
@@ -506,11 +506,14 @@ storage:
       device: udmac0d1e2
       eidIndex: 1
       fabricTag: supernode-a
-      maxRegisteredBytes: 512MiB
-      messageSize: 64KiB
-      window: 64
-      sendPostList: 16
-      transferTimeout: 10s
+      maxRegisteredBytes: 40MiB
+      txRegisteredBytes: 8MiB
+      maxInflightChunks: 64
+      postListSize: 1
+      pipelineDepth: 2
+      maxConcurrentTransfers: 16
+      transferTimeout: 30s
+      mmapContent: false
 
 download:
   protocol: urma
@@ -521,8 +524,11 @@ download:
 - `enable` 只控制是否 serve，`download.protocol: urma` 控制是否主动下载；
 - 任一角色需要 URMA 时启动同一个 manager；
 - `fabricTag` 是 operator 声明的可达域；
-- `messageSize` 必须被 provider max clamp；
-- `maxRegisteredBytes` 至少容纳一个 TX window、一个 RX window和控制保留；
+- provider message size 当前按固定 64 KiB slot 和 capability clamp，不暴露旧草案的 `messageSize/window`；
+- `maxRegisteredBytes` 是 process 预注册总量，`txRegisteredBytes` 是固定 TX 保底，RX 使用余量；默认
+  40 MiB/8 MiB 对应 TX 128/RX 512 slots，两个方向必须各至少保留一个 slot；
+- `pipelineDepth` 为 1..2，第二窗口使用 non-blocking admission，资源不足退化为单窗口；
+- `postListSize` 为 1..64，默认 1；真实 provider 校准前不照搬 demo 的 16；
 - 非 Linux 或无 `urma` feature 时，明确记录 URMA disabled，但 TCP 服务继续。
 
 ## 10. Piece 失败和 TCP fallback 边界

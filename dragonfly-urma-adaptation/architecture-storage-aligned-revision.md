@@ -1,7 +1,7 @@
 # 架构修订：URMA 作为 Dragonfly Storage 内部传输后端
 
 > 决策日期：2026-08-25  
-> 最近更新：2026-08-26  
+> 最近更新：2026-08-30  
 > 状态：Accepted  
 > 取代：独立 `dragonfly-client-urma-transport` crate 方案
 
@@ -19,8 +19,8 @@ dragonfly-client-storage
   src/urma/lane.rs         owned Jetty、descriptor、WR identity 与 lane state
   src/urma/buffer.rs       process-wide registered slot pool
   src/urma/ffi/            pointer-free UMDK shim ABI
-  src/client/urma.rs       Piece download adapter（后续实现）
-  src/server/urma.rs       Piece upload adapter（后续实现）
+  src/client/urma.rs       Piece download adapter
+  src/server/urma.rs       Piece upload adapter
 ```
 
 Cargo feature `urma` 定义在 `dragonfly-client-storage`，由 `dragonfly-client` 同名 feature
@@ -54,7 +54,7 @@ Dragonfly/RDMA rendezvous 与 Piece contract 出发，在需要 UMDK descriptor 
 - pointer-free C shim 与 shim-only bindgen allowlist；
 - Runtime/JFC/shared JFR/registered Segment/Jetty 生命周期；
 - fixed registered slot 状态机；
-- one-WR signaled SEND/RECV；
+- per-WR signaled SEND/RECV，可用 linked post-list 批量提交；
 - CQE 路由、generation/user_ctx 校验；
 - completion 前不释放 DMA buffer；
 - drain、错误聚合和逆序 shutdown。
@@ -63,6 +63,21 @@ Dragonfly/RDMA rendezvous 与 Piece contract 出发，在需要 UMDK descriptor 
 它们不是 public transport API。
 
 ## 4. 当前代码状态
+
+### 4.1 2026-08-30 Phase B 状态覆盖
+
+下方 4.2 记录的是 2026-08-26 的 owner/session 基线，保留用于说明演进过程，不再代表当前数据路径。
+当前 B1-B6 已完成代码实现：production RX 使用 registered window lease 直接写 Storage/digest，production
+TX 使用 registered lease direct-fill、mmap/RangeReader 和双窗口 ring；B5 已接入 linked SEND/RECV、
+partial-post 前缀记账与 CQ batch；B6 已接入 process byte ceiling、固定 TX/RX 分区、pipeline depth、
+optional second-window non-blocking 退化和预算压力指标。
+
+当前仍保持 Dragonfly 边界优先：demo 只验证 UMDK/URMA native 行为；同一 persistent Session 顺序处理
+Piece，不因 B6 引入同 lane Piece 并发。B5/B6 只有静态检查，feature-on 编译受本机缺少 `protoc`/Perl
+阻断，真实 provider correctness/性能统一进入 B7。最新逐项状态以
+`phase-b-performance-data-path.md` 和 `real-provider-validation-runbook.md` 为准。
+
+### 4.2 2026-08-26 owner/session 基线（历史）
 
 - 独立 `dragonfly-client-urma-transport` 已从 workspace 删除；
 - native core 已迁入 `dragonfly-client-storage/src/urma`；
@@ -89,7 +104,7 @@ Dragonfly/RDMA rendezvous 与 Piece contract 出发，在需要 UMDK descriptor 
 - progress/CQE/protocol error 会将 Fabric 标记为 `Failed/poisoned` 并唤醒全部 pending waiter，
   但 native WR、registered slot 仍保留到 CQE/flush 真正退休；operation timeout 会把所属 lane 置为
   Draining/ERROR、停止新 post，而不是伪造 liburma 不保证支持的 per-WR cancel；
-- 尚未实现 `client::urma`、`server::urma` 和真实 Piece 闭环。
+- 当时尚未实现 `client::urma`、`server::urma` 和真实 Piece 闭环；该项后来已完成。
 
 ### 4.3 通用 rendezvous 与 URMA receive credit
 

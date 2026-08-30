@@ -1,13 +1,18 @@
 # Phase B：URMA production 性能数据路径
 
-更新时间：2026-08-29。
+更新时间：2026-08-30。
 
 ## 0. 当前实施状态
 
-截至 2026-08-29，B1、B2、B3、B4 已完成代码实现和纯测试/编译验证；同日完成
-首次真实 provider 跨节点验证，B4 mmap direct-fill TX 生产路径 correctness
-PASS（见 0.1）。除此之外 Phase B 新数据路径的其余真机验证项（B2/B3 RX 路径、
-ring=2 overlap、fault/shutdown 等）尚未执行，因此 B1-B4 不整体标记为真机 PASS。
+截至 2026-08-30，B1-B6 已完成代码实现。B5/B6 已通过格式、metadata 和 diff 静态检查；当前环境
+缺少 `protoc`，且 vendored OpenSSL 构建缺少 Perl，因此尚未完成本轮 feature-on 编译/测试。此前
+B1-B4 已完成纯测试/编译验证，并在 2026-08-29 完成首次真实 provider 跨节点验证：B4 mmap
+direct-fill TX 生产路径 correctness PASS（见 0.1/0.2）。其余真机验证项尚未执行，因此 B1-B6
+不整体标记为真机 PASS。
+
+B5 已接入 linked SEND/RECV post-list、partial-post 前缀记账和现有 CQ batch/fair owner 调度；B6 已接入
+进程级 registered-byte ceiling、固定 TX 保底/RX 余量、可配置 pipeline depth、第二窗口 non-blocking
+申请与 budget-pressure 指标。B5/B6 尚无真实 provider correctness 或性能结论，统一进入 B7 验证。
 
 ### B1：registered window lease 基础已落地
 
@@ -64,8 +69,8 @@ ring=2 overlap、fault/shutdown 等）尚未执行，因此 B1-B4 不整体标�
   不会在 provider 仍引用 slot 时 recycle；
 - server 使用两个独立 lease 实现 ring：`send(current)` 与 `fill(next)` 并行；第二个 lease 因 TX pool
   压力或有界等待超时时退化为 ring=1，单窗必须等全部 CQE 后才 refill；
-- fixed TX pool 默认 128 slots，协商 SEND window 进一步限到半池容量，默认最多 64 chunks，为第二个
-  lease 保留形成 ring 的空间；这只是 B4 的固定池限界，不替代 B6 的多 peer fairness/shared overflow；
+- 默认 TX 分区为 128 slots，`pipelineDepth=2` 时协商 SEND window 进一步限到 64 chunks，为第二个
+  lease 保留形成 ring 的空间；B6 已将该分区改为 byte 配置，shared overflow/严格公平仍留待数据决定；
 - 新增 `storage.server.urma.mmapContent`，启用后 normal/persistent/persistent-cache 完成态 Piece 均先尝试
   `map_upload_piece`；cache-resident 或 mmap 失败仍走原有 upload `RangeReader`；
 - TX 当前为 `mmap/RangeReader -> registered TX spans -> NIC DMA`，只保留一次必要 source-fill copy。
@@ -118,9 +123,9 @@ cargo test -p dragonfly-client --features urma --lib            62 passed / 0 fa
   fault/shutdown、B2/B3 RX 路径真机 correctness、吞吐与 copy 口径的
   B7 同口径测量。
 
-结论修订：B4 mmap 生产路径的真机 correctness 已可标记 PASS；B1-B4 整体
-不据此整体标记真机 PASS，其余验证项仍按 B7/runbook 执行。下一实施点仍是
-B5 post/CQ/credit 批处理。
+当时结论：B4 mmap 生产路径的真机 correctness 已可标记 PASS；B1-B4 整体
+不据此整体标记真机 PASS，其余验证项仍按 B7/runbook 执行。该记录形成后已继续完成
+B5 post/CQ/credit 批处理和 B6 预算/退化代码；当前状态以第 0 节和第 8 节为准。
 
 ### 0.2 B4 双 ring（ring=2）真机验证记录（2026-08-29，node1 parent / node2 child）
 
@@ -283,18 +288,22 @@ demo 的真实 provider 结果证明了这些机制组合有价值，但不能�
 |---|---|---|
 | 注册方式 | 按需分配/注册 `PinnedBuf`，完成后进入 best-fit cache | Runtime 启动时注册一个连续 Segment |
 | 分配粒度 | 任意 logical length，复用最小可容纳 buffer | 固定 slot；当前默认 64 KiB |
-| 预算 | `max_registered_bytes` 共享 byte budget，支持 wait/try-acquire | 固定 TX/RX slot 数；当前默认 TX 128、RX 512，共 40 MiB |
+| 预算 | `max_registered_bytes` 共享 byte budget，支持 wait/try-acquire | process byte ceiling + 固定 TX/RX 分区；默认 40 MiB，其中 TX 8 MiB（128 slots）、RX 32 MiB（512 slots） |
 | window 布局 | 通常一个连续 `PooledBuf` | 多 slot 组成 multi-span logical window |
 | 回收 | 最后一个 operation/reader owner 释放后直接返回本地 pool | consumer 通过 urgent owner command 校验 lease/generation 后回收 |
 | 资源不足 | 等待预算或 non-blocking 失败 | `BufferUnavailable`；第二 window 安全退化为 pipeline depth 1 |
 
-URMA 必须补齐、但不要求照搬 RDMA 类型的能力：
+URMA 已在 B6 补齐、不要求照搬 RDMA 类型的能力：
 
-- process 级 registered-byte ceiling，active + idle/预留内存都计入；
-- 已持有一个 window 时，第二 window 只能 non-blocking acquire，禁止并发死锁；
-- 多 peer admission/fairness，以及 TX/RX 最小保留和共享 overflow 策略；
-- slot/byte active、idle、等待、分配失败、双窗口降级和 owner recycle latency 指标；
-- active lease、outstanding WR 与 Segment shutdown 的可审计生命周期。
+- `maxRegisteredBytes` 约束 process 级预注册 Segment 总量，active + idle/预留内存都计入；
+- `txRegisteredBytes` 提供固定 TX 保底，RX 使用剩余预算；两端各至少保留一个 64 KiB slot；
+- 已持有一个 window 时，第二 window 通过 non-blocking command admission/立即 slot 申请，失败退化为深度 1；
+- `pipelineDepth` 将方向 slot 数折算为单 window 上限，默认 2；
+- registered bytes 和 required/optional budget pressure 已有低基数 metrics；peer/Piece 维度保留在结构化日志；
+- active lease、outstanding WR、credit 与 Segment shutdown 继续通过 close/drain/recycle gate 审计。
+
+尚未实现的是 TX/RX shared overflow、动态 arena/size class，以及严格的跨 peer slot fairness；它们继续受
+下述真实 workload 证据门槛约束，不是 B6 当前固定分区方案的隐含承诺。
 
 只有真实 workload 出现以下证据时，才升级 allocator：
 
@@ -317,8 +326,8 @@ post/CQ/pwritev batching
 ```
 
 如果双窗口稳定、slot 利用率高、TX/RX 没有单边闲置、owner queue 不是瓶颈且 pinned memory 可接受，
-fixed slot pool 更简单且热路径没有 MR registration miss，应继续保留。B4/B5 先在现有 slot 模型上完成；
-B6 根据上述指标决定是否演进 allocator，不能为了与 RDMA 内部同形而提前重写。
+fixed slot pool 更简单且热路径没有 MR registration miss，应继续保留。B5/B6 已在现有 slot 模型上完成
+批处理和预算/退化最小闭环；是否继续演进 allocator 由 B7 指标决定，不能为了与 RDMA 内部同形而提前重写。
 
 ## 4. 目标架构
 
@@ -441,22 +450,37 @@ B2 消除了 RX slot -> `ReceivedChunk(Vec)` 和 chunk Vec -> aggregate window �
 
 ### B5：URMA post/CQ/credit 批处理
 
-1. 在 shim/FFI 增加最小的 linked WR/post-list API，批内每个 WR 保留独立 `user_ctx`。
-2. CQ polling 使用 provider 支持的 batch，正确处理 partial post、partial CQ、单 WR error 和 flush。
-3. 将 configured window、post-list、Jetty depth、JFC depth、slot count 和 remote posted credit 联合限界。
-4. credit update 可批量发送，但只有已 repost 的 RX 数量才可计入；保留最后 control/Done 所需 credit。
-5. owner thread 调度不能因持续 CQ busy polling 饿死 shutdown/abort/control command。
+`[状态：代码完成；格式/metadata/diff 静态检查通过，feature-on 编译与真实 provider 待验]`
+
+1. shim/FFI 已增加 linked SEND/RECV WR post-list，批内每个 WR 保留独立 `user_ctx`。
+2. UMDK `bad_wr` 被转换为成功提交前缀，Session 只为该前缀消费 slot/credit；未提交后缀可安全回收。
+3. lane 按 `postListSize` 分批，且仍由 configured window、Jetty/JFC depth、slot count 和 remote posted
+   credit 联合限界；默认值为 1，允许 1..64，避免未校准即改变生产行为。
+4. CQ 沿用 batch poll（当前 batch 16）和逐 WR completion route；partial CQ、单 WR error 与 flush仍按
+   独立 `user_ctx` 退休。
+5. owner 在 CQ 与 command 之间保留公平调度，持续 CQ busy 不得饿死 shutdown/abort/control command。
 
 具体默认值不照搬 demo 的 window 64/post-list 16；先由 capability 限界，再在真实 provider 上校准。
 
 ### B6：并发预算、配置与退化路径
 
-- process 全局 `max_registered_bytes`，并区分 TX/RX 保底或公平策略；
-- per-transfer max window、pipeline depth、post-list、mmap 开关；
-- `try_acquire` 避免持有一个 window 再阻塞等第二个造成并发死锁；
-- 内存不足时从双 window 退化成单 window，不退回无界 owned buffer；
-- endpoint/session failure 退休时，所有 WR、lease、credit 和 pending operation 可审计归零；
-- metrics 能按 peer/Piece 识别 budget pressure、source-fill 和 Storage backpressure。
+`[状态：最小固定分区方案代码完成；格式/metadata/diff 静态检查通过，feature-on 编译与真实 provider 待验]`
+
+- `maxRegisteredBytes` 默认 40 MiB、范围 128 KiB..4 GiB；`txRegisteredBytes` 默认 8 MiB，RX 使用
+  剩余预算。Runtime 仍一次注册连续 Segment，并按固定 64 KiB slot 划分，默认保持 TX 128/RX 512。
+- `pipelineDepth` 默认 2、范围 1..2；单 window 的方向上限为 `slots / pipelineDepth`，因此默认 TX
+  上限 64、RX 上限 256，最终仍受协商和 provider capability 限界。
+- 第一 window 属于 required admission，失败返回 BUSY/fallback；第二 TX/RX window 属于 optional，使用
+  non-blocking command admission 和立即 slot 申请，失败退化为 depth 1，不创建无界 owned buffer。
+- shared process Fabric 会校验预算配置一致性，不能静默创建不同 Segment 形态。
+- endpoint/session failure 继续等待 outstanding WR 归零，清 remote credit，并通过 lease book、pool close
+  gate、urgent recycle 和 pending completion 路径审计生命周期。
+- 新增 `dragonfly_client_urma_registered_bytes{direction="tx|rx"}` 和
+  `dragonfly_client_urma_budget_pressure_total{direction,stage}`（stage=`required|optional`）；peer/Piece、
+  source-fill、Storage backpressure 使用结构化日志，避免高基数 metric labels。
+
+B6 的协议边界不包含“同一 lane 并发多个 Piece”：同一 parent 的 persistent Session 仍顺序传 Piece；不同
+peer 使用独立 lane。TX/RX shared overflow、动态 allocator 和更强跨 peer fairness 留待 B7 数据决定。
 
 ### B7：真实 provider 验证与性能验收
 
@@ -499,7 +523,7 @@ Phase B 只有同时满足以下条件才完成：
 
 ## 8. 下一实施点
 
-B1-B4 已形成完整 RX/TX production copy-count 路径：RX direct positional write/digest，TX direct-fill、
-mmap/RangeReader fallback 和双 lease overlap。下一轮进入 B5 post/CQ/credit 批处理；同时保留
-B1-B4 的真实 provider correctness、尾 window、连续 Piece、故障和 outstanding shutdown 验证债务，
-不得把纯测试结果当作真机性能结论。
+B1-B6 已形成完整 RX/TX production copy-count、post batching 和固定注册预算/退化路径。下一轮进入 B7，
+在同一真实 provider 环境统一验证 B5/B6，并补齐 B1-B4 遗留的尾 window、连续 Piece、故障、budget
+pressure、公平进展和 outstanding shutdown 债务。当前机器无法完成的 feature-on 编译/测试也必须先在
+具备 `protoc`、Perl 和 UMDK build tree 的环境补跑；静态检查不得当作真机 correctness 或性能结论。

@@ -1,5 +1,10 @@
 没必要把 URMA slot pool 直接改造成 RDMA best-fit buffer pool。应该对齐的是生产能力和资源语义，不是内部数据结构。
 当前更合理的方向是保留 URMA 预注册 Segment，同时补齐 RDMA 已具备的预算、公平性和可观测能力。
+
+截至 2026-08-30，B6 已完成最小固定分区方案：`maxRegisteredBytes` 控制 process 预注册总量，
+`txRegisteredBytes` 提供 TX 保底，RX 使用余量；默认 40 MiB/8 MiB，仍对应 TX 128/RX 512 个
+64 KiB slots。第二窗口使用 non-blocking admission，失败安全退化为单窗口，并记录 registered bytes 与
+required/optional budget pressure。TX/RX shared overflow、动态 arena 和严格跨 peer slot fairness 尚未实现。
 必须对齐的能力包括：
 - 注册内存全局有界。
 - 资源不足时能等待、拒绝或安全退化，不能死锁。
@@ -15,7 +20,7 @@
 TX slots：90% 空闲
 RX slots：耗尽，频繁 BufferUnavailable
 或者反过来。
-这说明固定 128 TX + 512 RX 不适合实际流量，需要：
+如果真机数据出现这种单边闲置，说明固定分区（默认 128 TX + 512 RX）不适合实际流量，需要：
 - TX/RX 可借用共享区；
 - reserved minimum + shared overflow；
 - 或按当前连接方向动态划分 slot。
@@ -100,11 +105,11 @@ URMA 当前是启动时注册完整 Segment。可能出现：
 - 吞吐瓶颈在 Storage、source-fill、page fault 或链路本身。
 这时 fixed slot pool通常比动态 pool更好：更少分配、没有 MR cache miss、状态确定、故障和 shutdown 更容易审计。
 推荐路线
-目前不建议在 B4 前把 URMA 重写成 RDMA pool。更合适的顺序是：
-1. 保持现有 fixed Segment/slot，完成 B4 TX direct-fill/ring。
-2. 完成 B5 post/CQ/write batching，先消除 multi-span 的固定开销。
-3. 在 B6 补齐全局 byte budget、per-peer admission、TX/RX shared overflow 和指标。
-4. 真机确认存在碎片、分区失衡或频繁 pipeline 降级后，再选择：
+当前已按 fixed Segment/slot 完成 B4 direct-fill/ring、B5 post/CQ batching 和 B6 byte budget/固定方向
+分区/non-blocking 退化/指标。后续顺序是：
+1. 在真实 provider 上统一验证 linked post、partial post/error、pipeline depth 和 budget pressure。
+2. 用多 peer 压力数据确认是否存在碎片、固定分区失衡、饥饿或频繁 pipeline 降级。
+3. 只有证据成立时再选择：
    - 调整 slot size；
    - 多 size-class；
    - shared TX/RX slots；

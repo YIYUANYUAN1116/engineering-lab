@@ -1,6 +1,6 @@
 # Dragonfly URMA 真实 Provider 验证 Runbook
 
-更新日期：2026-08-29。本文只把真实 UMDK provider 结果标记为实验证据；编译、mock
+更新日期：2026-08-30。本文只把真实 UMDK provider 结果标记为实验证据；编译、mock
 或本地故障注入不等价于真机验证。
 
 ## 1. 已知可用环境
@@ -62,7 +62,12 @@ storage:
       device: udmac0d1e2
       eidIndex: 1
       fabricTag: validation-domain
+      maxRegisteredBytes: 40MiB
+      txRegisteredBytes: 8MiB
       maxInflightChunks: 64
+      postListSize: 1
+      pipelineDepth: 2
+      mmapContent: true
       maxConcurrentTransfers: 16
       transferTimeout: 30s
 
@@ -83,7 +88,11 @@ storage:
       device: udmac0d1e2
       eidIndex: 1
       fabricTag: validation-domain
+      maxRegisteredBytes: 40MiB
+      txRegisteredBytes: 8MiB
       maxInflightChunks: 64
+      postListSize: 1
+      pipelineDepth: 2
       maxConcurrentTransfers: 16
       transferTimeout: 30s
 
@@ -230,7 +239,44 @@ grep -E 'piece_number=256|length 12345|piece_id=.*-256' /tmp/dfdaemon-child.log
 grep -E 'piece_number=256|length 12345|piece_id=.*-256' /tmp/dfdaemon-parent.log
 ```
 
-## 5. 真实 completion 后故障注入
+## 5. B5/B6 批处理与注册预算验证
+
+B5/B6 尚未在真实 provider 上验证。先用默认兼容基线跑 correctness，再逐项只改一个变量：
+
+| 组 | `postListSize` | `pipelineDepth` | 注册预算 | 目的 |
+|---|---:|---:|---|---|
+| baseline | 1 | 2 | 40 MiB / TX 8 MiB | 与 B4 行为对照 |
+| post-list | 4、8、16 | 2 | 同 baseline | linked post correctness、吞吐和 CPU 校准 |
+| single-window | 8 | 1 | 同 baseline | 验证单窗口上限和无 overlap 路径 |
+| optional pressure | 8 | 2 | 缩小但仍容纳两个方向各一窗 | 第二窗失败后 ring/pipeline=1，传输仍成功 |
+| required pressure | 8 | 2 | 无法容纳 negotiated required window | 明确 BUSY/fallback，不出现无界 owned buffer |
+| multi-peer | 8 | 2 | baseline 与 pressure 各一轮 | 独立 lane 均有进展，无资源泄漏/长期饥饿 |
+
+`maxRegisteredBytes` 是 process 预注册总量；`txRegisteredBytes` 是固定 TX 分区，RX 使用余量。两者按
+64 KiB slot 向下换算，且 TX/RX 各至少一个 slot。`pipelineDepth=2` 时，单 window 最大 slot 数是方向
+slot 数的一半；这不是同一 lane 并发多个 Piece，同一 persistent Session 仍顺序处理 Piece。
+
+每一组至少覆盖：非整 chunk 尾部、连续 10 Piece、normal/persistent/persistent-cache、mmap 与 reader
+fallback。post-list 组还必须注入或构造 partial post、单 WR error、flush/断链，确认只消费成功提交前缀，
+未提交后缀可回收，所有已提交 WR 均由 CQE/error 路径退休。
+
+采集以下 Prometheus series（完整名称含现有 namespace/subsystem 前缀）：
+
+```text
+dragonfly_client_urma_registered_bytes{direction="tx|rx"}
+dragonfly_client_urma_budget_pressure_total{direction="tx|rx",stage="required|optional"}
+```
+
+同时保存两端 Piece finished 日志中的 `tx_windows`、`tx_ring_depth`、`tx_overlap_windows`、
+`tx_second_lease_fallback`、`tx_fill_ns`、`tx_send_wait_ns`，以及 RX Storage/backpressure 时间。验收要求：
+
+- baseline 的 registered bytes 为配置折算后的固定 TX/RX 分区，运行中不无界增长；
+- 正常双窗口组 optional pressure 不增长；压力组 optional 增长且 depth 1 fallback 可见；
+- required pressure 只在第一窗口无法取得时增长，并触发可分类 fallback；
+- 完成、失败、取消和 shutdown 后 outstanding WR、lease、slot、credit 均归零；
+- post-list 从 1 增大后的性能结论必须同时报告 E2E、source-fill、send-wait/CQ、Storage 和两端 CPU。
+
+## 6. 真实 completion 后故障注入
 
 只在 Child 的 validation binary 上设置：
 
@@ -259,11 +305,12 @@ streaming urma piece failed while writing, restarting over tcp
 unset DF_URMA_FAIL_AFTER_RECV_WINDOWS
 ```
 
-## 6. shutdown 和结果记录
+## 7. shutdown 和结果记录
 
 在有 outstanding transfer 时向 dfdaemon 发 `SIGTERM`，记录 capability clear、lane
 abort/drain、Fabric shutdown 和进程退出时间。重启后再跑一次正常 Piece，确认 provider
 资源可重建。
 
 每轮保留：节点/IP/device/EID、二进制 SHA-256、UMDK/provider 版本、完整两端
-日志、输入/输出 SHA-256、Piece 数、唯一 lane_id 数、fallback 数、CQE error 数。
+日志、输入/输出 SHA-256、Piece 数、唯一 lane_id 数、fallback 数、CQE error 数，以及本轮 B5/B6
+配置、上述 metrics 起止值和 Piece timing 摘要。

@@ -70,9 +70,9 @@ RDMA 当前是受 byte semaphore 限界的动态 best-fit registered buffer cach
 Segment 上的固定 TX/RX slot pool。前者对不同尺寸和方向更灵活，后者没有热路径 registration miss、
 状态更确定，但可能产生固定分区闲置、slot 内部碎片、multi-span syscall 和 owner recycle queue 开销。
 
-当前决定是不照搬 RDMA allocator，只对齐以下能力：全局 registered-byte budget、non-blocking 第二
-window acquire、多 peer fairness、TX/RX shared overflow、生命周期安全和完整指标。B4/B5 继续使用
-fixed slots；B6 只有在真机观察到以下信号后才选择 multi-size/shared arena 或 best-fit 演进：
+当前决定是不照搬 RDMA allocator。B6 已在 fixed slots 上实现 process registered-byte ceiling、固定 TX
+保底/RX 余量、non-blocking 第二 window acquire、生命周期审计和预算压力指标。尚未实现的是 TX/RX
+shared overflow、动态 arena/size class 和严格跨 peer slot fairness；只有在真机观察到以下信号后才演进：
 
 - TX/RX 一侧耗尽而另一侧长期空闲；
 - payload/registered bytes 利用率低；
@@ -122,8 +122,9 @@ dfdaemon UrmaServer task
 
 B4 已移除 TX owned window、per-chunk `.to_vec()` 和 shim Segment copy。每个 negotiated message 独占
 一个 slot，即使 chunk 小于固定 slot 也可同时 outstanding；最后一个 CQE 前 lease 不会返回/refill。
-默认 128 个 TX slots 将协商 window 限到半池 64 chunks，为第二 lease 留出空间；这不解决多 peer
-fairness，B6 仍按第 2.3 节的证据门槛决定 shared overflow/size class/动态 pool。
+默认配置现在由 `maxRegisteredBytes=40 MiB` 和 `txRegisteredBytes=8 MiB` 计算出 TX 128/RX 512 slots；
+`pipelineDepth=2` 将 TX 单 window 上限约束为 64 chunks，为第二 lease 留出空间。该固定分区仍不解决
+TX/RX shared overflow 或严格跨 peer slot fairness，后续演进仍按第 2.3 节的证据门槛决定。
 
 ## 4. Session production contract
 
@@ -146,9 +147,9 @@ B2/B3 又增加以下 RX contract：
 - 完整 window post 成功后才能发送 `RecvPosted`；write/hash 完成并 recycle 后才释放真实预算；
 - final lease 仍在 Done 校验后发布；blocking write 错误路径先 join 已提交 worker，再 reset/fallback。
 
-尚未放入 Session 的职责：
+不放入 Session 的职责：
 
-- 全局 TX/RX slot budget 和多 peer admission；
+- process 注册预算配置、方向分区和多 peer admission（由 shared Fabric/adapter 负责）；
 - discovery/cache/backoff；
 - Storage metadata/RangeReader；
 - limiter、metrics、digest 和 TCP fallback。
@@ -169,9 +170,10 @@ B2/B3 又增加以下 RX contract：
 | registered completion/atomic reservation/双窗口（B2） | 代码和纯测试完成 | 真机连续 Piece、背压、drop、尾 window |
 | Storage direct-write + digest overlap（B3） | 三类 Piece 代码和纯测试完成；production RX 0 staging-copy | 真机 correctness、故障与 overlap 指标 |
 | TX direct-fill/双 ring/mmap（B4） | 代码和纯测试完成；production TX 1 次 source-fill copy | 真机 mmap/reader/tail/ring=1/2/CQE ownership |
-| post/CQ/credit batch（B5） | 待实现 | partial post/CQ/error 路由与性能校准 |
+| post/CQ/credit batch（B5） | linked SEND/RECV、partial-post 前缀记账、CQ batch/fair owner 代码完成；静态检查通过 | feature-on 编译；真实 provider partial post/CQ/error/flush 与 postList 校准 |
+| budget/config/degradation（B6） | process byte ceiling、固定 TX/RX 分区、pipeline depth、optional second-window 退化和指标代码完成；静态检查通过 | feature-on 编译；真实 provider budget pressure、多 peer 进展、ring=1/2 与 shutdown 审计 |
 
-当前验证：
+截至 B4 的已验证基线：
 
 ```text
 cargo fmt --all -- --check                                    PASS
@@ -185,4 +187,6 @@ cargo test -p dragonfly-client --features urma --lib           62 passed / 0 fai
 ```
 
 说明：client 全量测试的本地 scheduler socket 用例在沙箱外运行并 62/62 通过；URMA 使用本地 UMDK
-build tree。B1-B4 未启动真实 provider，不能据此宣称跨节点 correctness 或性能 PASS。
+build tree。上述结果是 B4 时点基线，不代表 B5/B6 已通过同一组命令。2026-08-30 的 B5/B6 本轮仅
+确认 `cargo fmt --check`、`cargo metadata --no-deps` 和 `git diff --check`；feature-on check 被本机缺少
+`protoc` 与 Perl 阻断。真实 provider 验证仍需按 runbook 统一执行。
