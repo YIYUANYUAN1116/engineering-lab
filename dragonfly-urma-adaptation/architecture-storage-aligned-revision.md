@@ -77,6 +77,11 @@ Piece，不因 B6 引入同 lane Piece 并发。B5/B6 只有静态检查，featu
 阻断，真实 provider correctness/性能统一进入 B7。最新逐项状态以
 `phase-b-performance-data-path.md` 和 `real-provider-validation-runbook.md` 为准。
 
+2026-08-30 correctness review 补齐 shared-JFC retirement：shim 同时把 Jetty 和其 owned shared JFR
+置为 ERROR；completion DTO 暴露 `local_id` 并区分普通 WR、suspend-done、flush-done。owner 在普通
+outstanding WR 清零后仍继续 poll send JFC，直到该 lane 的 `WR_FLUSH_ERR_DONE` 到达才执行
+unbind/unimport/delete；recv JFC 不等待 fake done，只排空 JFR ERROR 产生的真实 WR completion。
+
 ### 4.2 2026-08-26 owner/session 基线（历史）
 
 - 独立 `dragonfly-client-urma-transport` 已从 workspace 删除；
@@ -173,8 +178,8 @@ RDMA feature-gated Rust client/server type-check  PASS
    允许显式 shutdown 或 `Drop` 重试；不再出现 C 已释放而 Rust 再次 close 的悬空指针路径。
 2. JFC poll 返回一个 batch 后，即使其中某条 CQE 路由失败，也继续路由本 batch 的所有后续
    CQE；send JFC 出错也不阻止本轮继续 poll recv JFC。完整退休已被 provider 消费的 WR/slot 后，
-   再把记录到的第一个错误返回给 runtime。`WR_FLUSH_ERR_DONE` 仍作为无 WR `user_ctx` 的 drain
-   sentinel，不能据此提前跳过同 batch 的真实 WR completion。
+   再把记录到的第一个错误返回给 runtime。`WR_FLUSH_ERR_DONE` 是无 WR `user_ctx` 的 lane lifecycle
+   event，必须按 `local_id` 路由并作为删除门槛，不能据此提前跳过同 batch 的真实 WR completion。
 
 约束由此明确为：
 
@@ -215,7 +220,8 @@ single owner thread
 全局 `FabricCompletion` channel 已删除。每个 post 的 handle 是唯一逻辑 completion owner；调用方
 drop handle 只代表不再等待，router 仍持有 WR/buffer，CQE 到达后照常回收。显式 timeout 除了结束
 等待，还会请求 lane `mark_error` 进入 Draining，以 flush outstanding；在 outstanding 清零前
-`close_lane` 仍拒绝释放 Jetty。fatal progress error 会先失败唤醒所有 waiter，再继续安全 drain，
+`close_lane` 仍拒绝释放 Jetty；即使 outstanding 已清零，也必须等 send JFC 的 flush-done。fatal
+progress error 会先失败唤醒所有 waiter，再继续安全 drain，
 因此慢 session consumer 不再能因为共享 channel 堵塞而 poison 整个 Fabric。
 
 这一步只解决“谁拥有 native state、谁推进 CQ、如何把完成事件送回 async caller”，尚未解决远端

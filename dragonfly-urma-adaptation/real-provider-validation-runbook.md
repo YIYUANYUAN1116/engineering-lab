@@ -3,6 +3,11 @@
 更新日期：2026-08-30。本文只把真实 UMDK provider 结果标记为实验证据；编译、mock
 或本地故障注入不等价于真机验证。
 
+B7 自动化工具位于 `tools/urma-b7/`：`discover/plan` 负责只读发现和拓扑冻结，
+`prepare/run/cleanup` 默认 dry-run，只有显式 `--execute` 才操作远端。执行路径使用 run-scoped
+YAML/socket/storage/port/origin，按 owner marker、PID cmdline 和精确路径限制启停与清理；使用方法见
+`tools/urma-b7/README.md`。
+
 ## 1. 已知可用环境
 
 `urma-transport-lab/tcp-urma-file-transfer` 在 2026-08-24 确认的跨节点组合：
@@ -258,7 +263,9 @@ slot 数的一半；这不是同一 lane 并发多个 Piece，同一 persistent 
 
 每一组至少覆盖：非整 chunk 尾部、连续 10 Piece、normal/persistent/persistent-cache、mmap 与 reader
 fallback。post-list 组还必须注入或构造 partial post、单 WR error、flush/断链，确认只消费成功提交前缀，
-未提交后缀可回收，所有已提交 WR 均由 CQE/error 路径退休。
+未提交后缀可回收，所有已提交 WR 均由 CQE/error 路径退休。flush/断链时额外确认：Jetty 和其 owned
+shared JFR 都成功进入 ERROR；recv JFC 只排空真实 WR completion；send JFC 的
+`WR_FLUSH_ERR_DONE` 通过 `local_id` 命中正确 lane，且不会 poison 其他健康 lane。
 
 采集以下 Prometheus series（完整名称含现有 namespace/subsystem 前缀）：
 
@@ -310,6 +317,11 @@ unset DF_URMA_FAIL_AFTER_RECV_WINDOWS
 在有 outstanding transfer 时向 dfdaemon 发 `SIGTERM`，记录 capability clear、lane
 abort/drain、Fabric shutdown 和进程退出时间。重启后再跑一次正常 Piece，确认 provider
 资源可重建。
+
+至少同时建立两个 lane，再只中断其中一个：被中断 lane 必须等“outstanding WR=0 + send flush-done”
+后才删除 Jetty/JFR；另一 lane 应继续完成 Piece。日志中不应出现 unknown native Jetty、receive-JFC
+flush-done、提前 delete 或 Fabric 被预期的 flush completion poison。随后对无 outstanding WR 的空闲
+lane 执行关闭，确认 owner 仍会继续 poll 到 fake flush-done，而不是因 outstanding=0 提前删除。
 
 每轮保留：节点/IP/device/EID、二进制 SHA-256、UMDK/provider 版本、完整两端
 日志、输入/输出 SHA-256、Piece 数、唯一 lane_id 数、fallback 数、CQE error 数，以及本轮 B5/B6

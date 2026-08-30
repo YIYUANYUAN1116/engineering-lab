@@ -596,7 +596,10 @@ Fabric owner thread 给出明确完成结果。
 - send JFC 的错误不能阻止同一 progress iteration 继续处理 recv JFC；完成两侧 drain 后再返回
   记录到的首个错误；
 - `URMA_CR_WR_FLUSH_ERR_DONE` 是无有效 WR `user_ctx` 的 drain sentinel，真实 outstanding WR 由
-  `URMA_CR_WR_FLUSH_ERR` completion 退休，不能混为同一种 CQE。
+  `URMA_CR_WR_FLUSH_ERR` completion 退休，不能混为同一种 CQE。shared-JFC 模式下 sentinel 必须按
+  `cr.local_id` 路由到对应 lane；Jetty 与其 owned shared JFR 都已成功置 ERROR、普通 WR 已清零且
+  send JFC 的 sentinel 已到达后，才能 unbind/unimport/delete。recv JFC 不产生该 sentinel，只排空
+  JFR ERROR 产生的 completion。
 
 ## 12. 实施任务拆分
 
@@ -636,6 +639,11 @@ flush/shutdown 验证；本地 lane Ready 仍不代表远端已 post RECV。
 control connection/Jetty 可顺序复用 `Request/Ready/RecvPosted/Done` 传输多个 Piece。Child 先 post
 RECV 再发送 `RecvPosted`，Parent 逐 window 严格验证后才 grant SEND credit。session Drop/timeout 会
 abort lane，最后一个 CQE/flush 退休后 owner 自动 reap Draining lane。
+
+当前 owner 即使在普通 outstanding WR 已清零后，也会为处于 Draining 的 lane 继续 poll shared send
+JFC，避免漏掉稍后到达的 `WR_FLUSH_ERR_DONE`；该 fake CQE 不再因无有效 `user_ctx` 被当作 Fabric 级
+completion corruption。`WR_SUSPEND_DONE` 保持独立的异常 lifecycle 事件，当前仍按 fatal progress
+error 处理，不与正常 retirement 混用。
 
 2026-08-26 完成 adapter 前 production contract 收敛：peer Error 保留 code/message；control
 read/write 全部有显式 timeout；request/metadata 改为 owned 返回；server 增加 `reject_piece`；

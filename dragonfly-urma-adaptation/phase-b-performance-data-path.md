@@ -12,7 +12,10 @@ direct-fill TX 生产路径 correctness PASS（见 0.1/0.2）。其余真机验�
 
 B5 已接入 linked SEND/RECV post-list、partial-post 前缀记账和现有 CQ batch/fair owner 调度；B6 已接入
 进程级 registered-byte ceiling、固定 TX 保底/RX 余量、可配置 pipeline depth、第二窗口 non-blocking
-申请与 budget-pressure 指标。B5/B6 尚无真实 provider correctness 或性能结论，统一进入 B7 验证。
+申请与 budget-pressure 指标。2026-08-30 correctness review 后又补齐 shared-JFC lane retirement：Jetty
+及其 owned shared JFR 一并进入 ERROR，发送侧 `WR_FLUSH_ERR_DONE` 按 native `local_id` 路由；只有普通
+WR 已全部退休且 flush-done 已到达才删除 Jetty/JFR。B5/B6 尚无真实 provider correctness 或性能结论，
+统一进入 B7 验证。
 
 ### B1：registered window lease 基础已落地
 
@@ -456,8 +459,9 @@ B2 消除了 RX slot -> `ReceivedChunk(Vec)` 和 chunk Vec -> aggregate window �
 2. UMDK `bad_wr` 被转换为成功提交前缀，Session 只为该前缀消费 slot/credit；未提交后缀可安全回收。
 3. lane 按 `postListSize` 分批，且仍由 configured window、Jetty/JFC depth、slot count 和 remote posted
    credit 联合限界；默认值为 1，允许 1..64，避免未校准即改变生产行为。
-4. CQ 沿用 batch poll（当前 batch 16）和逐 WR completion route；partial CQ、单 WR error 与 flush仍按
-   独立 `user_ctx` 退休。
+4. CQ 沿用 batch poll（当前 batch 16）和逐 WR completion route；partial CQ、单 WR error 仍按独立
+   `user_ctx` 退休。无有效 `user_ctx` 的 `WR_FLUSH_ERR_DONE` 改按 native Jetty `local_id` 路由，不能
+   poison 整个 Fabric，也不能替代真实 `WR_FLUSH_ERR` 对 outstanding WR 的逐条退休。
 5. owner 在 CQ 与 command 之间保留公平调度，持续 CQ busy 不得饿死 shutdown/abort/control command。
 
 具体默认值不照搬 demo 的 window 64/post-list 16；先由 capability 限界，再在真实 provider 上校准。
@@ -526,4 +530,5 @@ Phase B 只有同时满足以下条件才完成：
 B1-B6 已形成完整 RX/TX production copy-count、post batching 和固定注册预算/退化路径。下一轮进入 B7，
 在同一真实 provider 环境统一验证 B5/B6，并补齐 B1-B4 遗留的尾 window、连续 Piece、故障、budget
 pressure、公平进展和 outstanding shutdown 债务。当前机器无法完成的 feature-on 编译/测试也必须先在
-具备 `protoc`、Perl 和 UMDK build tree 的环境补跑；静态检查不得当作真机 correctness 或性能结论。
+具备 `protoc`、Perl 和 UMDK build tree 的环境补跑；其中必须覆盖 Jetty/JFR 双 ERROR、send JFC
+flush-done、recv JFC drain 以及多 lane 共享 JFC 的顺序删除。静态检查不得当作真机 correctness 或性能结论。

@@ -2,6 +2,9 @@
 
 本目录记录 Dragonfly `dfdaemon` 适配 UMDK/URMA 的实施分析、阶段设计和验证状态。
 
+B7 自动化工具位于 [`tools/urma-b7/`](tools/urma-b7/README.md)，支持双机和单机双实例拓扑的只读
+环境发现与 dry-run 计划生成。
+
 ## 当前源码基线
 
 - Dragonfly 根仓库：`/home/yuan/workspace/dev/dragonfly`，`main`，`39c586d5`。
