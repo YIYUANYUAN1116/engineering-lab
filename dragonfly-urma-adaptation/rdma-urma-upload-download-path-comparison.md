@@ -170,8 +170,8 @@ B2/B3 又增加以下 RX contract：
 | registered completion/atomic reservation/双窗口（B2） | 代码和纯测试完成 | 真机连续 Piece、背压、drop、尾 window |
 | Storage direct-write + digest overlap（B3） | 三类 Piece 代码和纯测试完成；production RX 0 staging-copy | 真机 correctness、故障与 overlap 指标 |
 | TX direct-fill/双 ring/mmap（B4） | 代码和纯测试完成；production TX 1 次 source-fill copy | 真机 mmap/reader/tail/ring=1/2/CQE ownership |
-| post/CQ/credit batch（B5） | linked SEND/RECV、partial-post 前缀记账、CQ batch/fair owner 代码完成；静态检查通过 | feature-on 编译；真实 provider partial post/CQ/error/flush 与 postList 校准 |
-| budget/config/degradation（B6） | process byte ceiling、固定 TX/RX 分区、pipeline depth、optional second-window 退化和指标代码完成；静态检查通过 | feature-on 编译；真实 provider budget pressure、多 peer 进展、ring=1/2 与 shutdown 审计 |
+| post/CQ/credit batch（B5） | linked SEND/RECV、partial-post 前缀记账、CQ batch/fair owner 代码完成；单 lane postListSize=1/8 真机正常路径矩阵完成，结果见 B7 性能台账 | feature-on 编译记录；真实 provider partial post/CQ/error/flush 与多 peer 校准 |
+| budget/config/degradation（B6） | process byte ceiling、固定 TX/RX 分区、pipeline depth、optional second-window 退化和指标代码完成；inflight=16/32/64 单 lane真机矩阵完成 | feature-on 编译记录；真实 provider budget pressure、多 peer 进展与 shutdown 审计 |
 
 截至 B4 的已验证基线：
 

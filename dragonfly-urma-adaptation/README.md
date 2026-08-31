@@ -24,6 +24,7 @@ B7 自动化工具位于 [`tools/urma-b7/`](tools/urma-b7/README.md)，支持双
 6. [A1：UrmaEngine owner thread 骨架状态（历史）](./phase-a-a1-engine-owner-status.md)
 7. [真实 Provider 验证 Runbook](./real-provider-validation-runbook.md)
 8. [Phase B：URMA production 性能数据路径](./phase-b-performance-data-path.md)
+9. [B7 真实 Provider 性能验证台账](./b7-real-provider-performance-ledger.md)
 
 ## 证据口径
 

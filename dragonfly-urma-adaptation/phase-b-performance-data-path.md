@@ -1,21 +1,24 @@
 # Phase B：URMA production 性能数据路径
 
-更新时间：2026-08-30。
+更新时间：2026-08-31。
 
 ## 0. 当前实施状态
 
-截至 2026-08-30，B1-B6 已完成代码实现。B5/B6 已通过格式、metadata 和 diff 静态检查；当前环境
-缺少 `protoc`，且 vendored OpenSSL 构建缺少 Perl，因此尚未完成本轮 feature-on 编译/测试。此前
-B1-B4 已完成纯测试/编译验证，并在 2026-08-29 完成首次真实 provider 跨节点验证：B4 mmap
-direct-fill TX 生产路径 correctness PASS（见 0.1/0.2）。其余真机验证项尚未执行，因此 B1-B6
-不整体标记为真机 PASS。
+截至 2026-08-31，B1-B6 已完成代码实现。B5/B6 在当前开发环境完成格式、metadata 和 diff 静态检查；
+该环境缺少 `protoc`，且 vendored OpenSSL 构建缺少 Perl，因此仍没有在同一环境补齐 feature-on
+编译/单测。真实 provider 节点已运行包含 B5/B6 的 validation binary：B4 mmap direct-fill correctness
+见 0.1/0.2，B5 post-list 与 B6 inflight 的六组单流矩阵见 B7 性能台账。fault、budget pressure、
+多 peer 和 outstanding shutdown 尚未执行，因此 B1-B6 不整体标记为真机 PASS。
 
 B5 已接入 linked SEND/RECV post-list、partial-post 前缀记账和现有 CQ batch/fair owner 调度；B6 已接入
 进程级 registered-byte ceiling、固定 TX 保底/RX 余量、可配置 pipeline depth、第二窗口 non-blocking
 申请与 budget-pressure 指标。2026-08-30 correctness review 后又补齐 shared-JFC lane retirement：Jetty
 及其 owned shared JFR 一并进入 ERROR，发送侧 `WR_FLUSH_ERR_DONE` 按 native `local_id` 路由；只有普通
-WR 已全部退休且 flush-done 已到达才删除 Jetty/JFR。B5/B6 尚无真实 provider correctness 或性能结论，
-统一进入 B7 验证。
+WR 已全部退休且 flush-done 已到达才删除 Jetty/JFR。2026-08-31 已完成 B5/B6 单 parent、单 child、
+单 lane 的真实 provider 参数矩阵：修复 benchmark output 跨文件系统 copy 后，当前最优
+`post8-in64` 达到 2410.47 MiB/s；完整口径、六组参数和作废数据见
+[B7 真实 Provider 性能验证台账](./b7-real-provider-performance-ledger.md)。该结果不覆盖多 peer、budget
+pressure、公平性、fault 或 outstanding shutdown，因此 B1-B6 仍不整体标记为真机 PASS。
 
 ### B1：registered window lease 基础已落地
 
@@ -453,7 +456,7 @@ B2 消除了 RX slot -> `ReceivedChunk(Vec)` 和 chunk Vec -> aggregate window �
 
 ### B5：URMA post/CQ/credit 批处理
 
-`[状态：代码完成；格式/metadata/diff 静态检查通过，feature-on 编译与真实 provider 待验]`
+`[状态：代码完成；单 lane postListSize=1/8 真实 provider 正常路径和性能矩阵已测；partial-post、错误 CQE、flush 与多 peer 待验]`
 
 1. shim/FFI 已增加 linked SEND/RECV WR post-list，批内每个 WR 保留独立 `user_ctx`。
 2. UMDK `bad_wr` 被转换为成功提交前缀，Session 只为该前缀消费 slot/credit；未提交后缀可安全回收。
@@ -468,7 +471,7 @@ B2 消除了 RX slot -> `ReceivedChunk(Vec)` 和 chunk Vec -> aggregate window �
 
 ### B6：并发预算、配置与退化路径
 
-`[状态：最小固定分区方案代码完成；格式/metadata/diff 静态检查通过，feature-on 编译与真实 provider 待验]`
+`[状态：最小固定分区方案代码完成；inflight=16/32/64 单 lane 真机矩阵已测；budget pressure、跨 peer 公平与并发退化待验]`
 
 - `maxRegisteredBytes` 默认 40 MiB、范围 128 KiB..4 GiB；`txRegisteredBytes` 默认 8 MiB，RX 使用
   剩余预算。Runtime 仍一次注册连续 Segment，并按固定 64 KiB slot 划分，默认保持 TX 128/RX 512。
@@ -487,6 +490,11 @@ B6 的协议边界不包含“同一 lane 并发多个 Piece”：同一 parent 
 peer 使用独立 lane。TX/RX shared overflow、动态 allocator 和更强跨 peer fairness 留待 B7 数据决定。
 
 ### B7：真实 provider 验证与性能验收
+
+2026-08-31 已完成固定 topology 的 1 GiB 单 lane 参数矩阵，当前有效最佳结果为
+`post8-in64 = 2410.47 MiB/s`；参见
+[B7 真实 Provider 性能验证台账](./b7-real-provider-performance-ledger.md)。这只覆盖下列顺序中的
+连续正常路径和单流性能观测，不替代尚未执行的 fault、资源压力和多 peer 项。
 
 验证顺序：
 
