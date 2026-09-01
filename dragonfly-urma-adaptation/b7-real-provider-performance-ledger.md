@@ -1,6 +1,6 @@
 # B7 真实 Provider 性能验证台账
 
-更新时间：2026-08-31。
+更新时间：2026-09-01。
 
 本文记录 Dragonfly URMA Phase B 在真实 provider、node1 parent / node2 child 环境中的性能实验。
 它只登记已经取得的实验数据、统计口径和由数据支持的结论；并发、多 peer、故障和 shutdown 结果在完成
@@ -167,7 +167,7 @@ aggregate          990.12 MiB/s
 6. **不继续把单流细调作为并发前置。** post4/16/32 sweep 可在并发结果表明仍由 batching 限制时再做；
    当前应进入同 lane 排队、TX fan-out 和 RX fan-in 验证。
 
-## 5. 并发阶段的基线与待验证假设
+## 5. 并发阶段前的基线与待验证假设
 
 并发测试保留两个单流对照：
 
@@ -185,4 +185,89 @@ aggregate          990.12 MiB/s
 - fan-out（一个 parent、多 child daemon）用于验证共享 TX pool/JFC/owner fairness；fan-in（多 parent
   daemon、一个 child）用于验证共享 RX pool、Storage 和 digest 并发。
 
-上述内容均为下一阶段假设，不得在真实并发数据取得前标记为 PASS 或生产容量结论。
+上述内容是进入并发阶段前形成的假设；真实 fan-out 验证结果及已确认结论见第 6 节。
+
+## 6. Fan-out 并发 lane 与 TX admission 验证
+
+以下结果来自 node1 parent 向 node2 多 child daemon 的 fan-out correctness/performance 测试。
+吞吐为各 measured batch 的 aggregate throughput；Gbps 按 `MiB/s * 8 * 2^20 / 10^9` 换算。
+`required pressure`、`optional pressure`、`optional -> ring1`、session retire 和 TCP fallback
+均来自 correctness run 的完整证据集合。
+
+| case | pipeline | TX 预算 | 结果 | aggregate MiB/s | Gbps | Jain | completion skew | required pressure | optional pressure | optional -> ring1 | session retire | TCP fallback | 备注 |
+|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `fanout-post1-in32-l2` | 2 | TX8 | PASS | **3568.80** | **29.94** | 0.99887 | 36.2 ms | — | — | — | 0 | 0 | 2 lane 基线，多 lane 扩展成立 |
+| `fanout-post1-in32-l4-pipe1-tx8` | 1 | TX8 | PASS | **6251.35** | **52.44** | 0.99872 | 57.08 ms | 0 | 0 | 0 | 0 | 0 | 4 lane、单 ring；TX8 正好容纳 4 个 required window |
+| `fanout-post1-in32-l4-pipe2-tx16` | 2 | TX16 | PASS | **5197.70** | **43.60** | 0.99945 | 46.86 ms | 0 | 0 | 0 | 0 | 0 | 4 lane、双 ring，有足够 TX 预算 |
+| `fanout-post1-in32-l4`（旧实现） | 2 | TX8 | FAIL | **3338.45** | **28.01** | 0.98038 | 235.0 ms | **45** | **34** | 34 | churn | **3453** | required/optional 争抢；BUSY 被当作 transport fault，导致 lane churn 和大量 TCP fallback |
+| `pipe2+TX8 transient BUSY`（tracing 未修） | 2 | TX8 | FAIL | **316.22** | **2.65** | 0.95812 | 7793.8 ms | 0 | 0 | 429 | **7** | **1254** | transient BUSY 避免了原 admission churn，但 tracing panic 导致 reset/EOF 和 session failure |
+| `pipe2+TX8 tracingfix` | 2 | TX8 | tools FAIL | **6225.16** | **52.22** | 0.99667 | 89.90 ms | **1445** | **1414** | 1414 | 0 | **1445** | lane 不再 retire；BUSY 只使当前 Piece fallback TCP，transport 稳定但并非纯 URMA |
+| `pipe2+TX8 admissionfix` | 2 | TX8 | **PASS** | **4948.56** | **41.51** | **0.99903** | **52.04 ms** | **0** | **3956** | **1492** | **0** | **0** | 当前 correctness 基准：required admission 有保障，optional 不足时退化为 ring1，纯 URMA 跑通 |
+
+### 6.1 数据支持的结论
+
+1. **多 lane transport concurrency 已成立。** 2 lane 和 4 lane correctness case 均能在无 session
+   retire、无 TCP fallback 的条件下完成，Jain 指数均高于 0.998。
+2. **pipe2 + TX8 的原始失败是 TX admission 策略问题，不是 lane 绑定问题。** 旧实现中 required 与
+   optional window 直接竞争固定 TX pool；required 失败后的 terminal failure policy 又放大为 lane churn
+   和 3453 次 TCP fallback。
+3. **transient BUSY 只修复了故障分类，没有构成纯 URMA admission。** tracing 修复后的 6225.16 MiB/s
+   结果仍包含 1445 次 TCP fallback，因此不得作为 URMA transport 吞吐基线。
+4. **required-first admission 已通过 correctness 验证。** admissionfix 将 required pressure、session
+   retire 和 TCP fallback 全部降为 0；TX8 不足以维持所有 lane 的双 ring 时，optional window 主动让位，
+   Piece 使用 ring1 继续走 URMA。
+5. **`optional pressure` 不等于传输失败。** admissionfix 中 3956 次 optional pressure 和 1492 次
+   ring1 降级是受控背压证据；该 case 仍为纯 URMA PASS。
+6. **当前 pipe2 + TX8 correctness/performance 基准为 4948.56 MiB/s（41.51 Gbps）。** 相比
+   pipe1 + TX8 的 6251.35 MiB/s，吞吐下降约 20.8%，反映低 TX 预算下的 admission 等待和 ring1
+   降级成本；不能用包含 TCP fallback 的 tracingfix 数字评价 URMA admissionfix 的性能回退。
+
+## 7. Fan-in 并发 lane 与 RX admission 验证
+
+以下结果来自多个 node2 child server 同时向 node1 parent downloader 提供内容的 fan-in 测试。共享
+RX pool 位于 parent process；每个 child 拥有独立 TX pool。case 均使用 `post1-in32`、pipeline depth 2、
+1 个 warmup batch 和 3 个 measured batch，每个 task 为 1 GiB。
+
+`required pressure` 表示 required RX window 等待至 transfer timeout 后仍无法获得资源；
+`required wait count` 和 `required wait` 则统计最终成功但曾等待 lease 回收的 required admission。
+因此 `required pressure = 0` 与 `required wait count > 0` 并不矛盾。
+
+| case | lanes | RX 预算 | 结果 | aggregate MiB/s | Gbps | Jain | completion skew | required pressure | optional pressure | required wait count | required wait total | required wait mean | session retire | TCP fallback |
+|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `b73-fanin-l2-pipe2-rx16-001` | 2 | RX16 | PASS | **4033.38** | **33.83** | 0.99443 | 68.05 ms | 0 | 52 | 0 | 0 ms | 0 ms | 0 | 0 |
+| `b73-fanin-l2-pipe2-rx8-001` | 2 | RX8 | PASS | **2889.96** | **24.24** | 0.99743 | 61.24 ms | 0 | 1294 | 817 | 1562.55 ms | 1.913 ms | 0 | 0 |
+| `b73-fanin-l4-pipe2-rx16-001` | 4 | RX16 | PASS | **3874.43** | **32.50** | 0.95845 | 443.54 ms | 0 | 1810 | 934 | 1755.23 ms | 1.879 ms | 0 | 0 |
+| `b73-fanin-l4-pipe2-rx8-001` | 4 | RX8 | PASS | **3255.36** | **27.31** | 0.98897 | 285.56 ms | 0 | 3552 | 2588 | 6907.41 ms | 2.669 ms | 0 | 0 |
+
+### 7.1 RX admissionfix 重复性
+
+在上述预算矩阵前，`fanin-post1-in32-l2 + pipeline2` 使用默认 RX32 预算连续复跑 5 次：
+
+- 5/5 PASS，required pressure、session retire、TCP fallback 和 previous transfer failure 均为 0；
+- aggregate throughput 均值为 3654.88 MiB/s，中位数 3713.86 MiB/s，范围为
+  3198.93--4315.47 MiB/s；
+- Jain 均值为 0.99592，completion skew 均值为 60.12 ms；
+- optional pressure 每轮为 2--456，合计 961；所有 shortage 均对应 optional 单窗口降级；
+- 该组运行早于 required-wait 指标加入，因此不能从 `required pressure = 0` 反推 required wait count 为 0。
+
+### 7.2 数据支持的结论
+
+1. **RX required-first admission 在当前矩阵中通过 correctness 验证。** 四个 case 全部为纯 URMA
+   PASS；即使 RX8 下出现 2588 次 required wait，也没有 required timeout、lane churn、session retire
+   或 TCP fallback。
+2. **RX16 足以覆盖 2 lane 的本轮 required 工作集，但不足以让 4 lane 始终无等待。** 2 lane RX16
+   的 required wait 为 0，仅有 52 次 optional 降级；4 lane RX16 出现 934 次 required wait 和
+   1810 次 optional 降级。registered lease 跨 Piece 的 Storage 消费周期存活，因此不能只按静态
+   `lanes * pipeline depth * window size` 判断运行时是否无压力。
+3. **RX8 已进入明显的预算受限区。** 相比同 lane 数的 RX16，RX8 在 2 lane 下吞吐下降 28.35%，
+   在 4 lane 下下降 15.98%；4 lane RX8 的 required wait 总时长为 6.91 s，单次均值 2.669 ms。
+4. **受控等待没有被放大为 transport failure。** 所有 case 的 required pressure、session retire、
+   TCP fallback 均为 0；optional pressure 只使 receive pipeline 降级到单窗口。
+5. **增加 lane 数没有在 RX16 下提高 aggregate throughput。** RX16 从 2 lane 增加到 4 lane 后，
+   aggregate throughput 下降 3.94%，Jain 从 0.99443 降至 0.95845，completion skew 从 68.05 ms
+   增至 443.54 ms。当前瓶颈已经进入共享 RX/Storage/主机资源，而不是缺少 transport lane。
+6. **RX8 下增加 lane 可以隐藏部分等待，但显著放大争用。** 4 lane 相比 2 lane 的 aggregate
+   throughput 提升 12.64%，同时 required wait count 增至 3.17 倍、总等待时间增至 4.42 倍，
+   completion skew 增至 4.66 倍；这不是更充足的 RX admission，而是更多并发对等待的覆盖。
+7. **矩阵的性能排序仍需重复样本确认。** 当前四个预算点各只有一次 run；它们足以确认 correctness
+   和 RX8/RX16 压力级别，但吞吐、公平性和 skew 的精确差异应至少再复跑 3 次后再作为稳定基线。
