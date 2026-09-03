@@ -469,6 +469,9 @@ CC8--CC16 可视为该环境下的有效饱和点。25 Gbps 的理论单向带�
 `post1-pipe2-in16`，每个 case 使用 2 次 warmup 和 5 次 measured task。manifest 的 task concurrency
 仍为 1；CC 只表示 `download.concurrentPieceCount`。
 
+> 本节 12.1--12.4 是接收端改用 vectored positional write 之前的历史基线。12.5 记录 `pwritev`
+> 优化后的首个正式点；后续 concurrency 曲线必须单独登记，不与本表混合覆盖。
+
 | run | Piece concurrency | 结果 | measured data | aggregate MiB/s | Gbps | 同 CC TCP MiB/s | 相对 TCP |
 |---|---:|---|---:|---:|---:|---:|---:|
 | `urma-piece-cc1-001` | 1 | **PASS** | 5 GiB | **1670.79** | **14.02** | 1581.77 | +5.63% |
@@ -534,3 +537,87 @@ transport-only 与 CRC32+write 分层基准以及 CPU/completion profiling，而
 UMDK 64 KiB SEND microbenchmark 的平均值为 67405.55 MB/s，而本组最佳 E2E 约为 5764 MB/s，仅相当于
 裸 SEND 数值的约 8.55%。该比例只用于说明仍有优化空间，不能作为等价效率指标：Dragonfly E2E 额外包含
 Piece 调度、控制协议、CRC32、文件读写和完成物化等开销。
+
+### 12.4 Piece 大小与 demo 参数对齐实验（`pwritev` 前）
+
+固定单个 `dfget`、1 GiB 文件、post1、pipe2、in16、Piece concurrency 16，每组使用 1 次 warmup +
+3 次 measured task；只改变 Piece 大小。所有 case 均 PASS，且无 BUSY、session retirement、TCP fallback
+或 previous-transfer failure。
+
+| run | Piece 大小 | aggregate MiB/s | Gbps | min / median / max MiB/s | TX req/opt | RX req/opt | TX ring1 / RX window1 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `urma-piece-4mib-cc16-001` | 4 MiB | **4802.31** | **40.28** | 4688.00 / 4776.37 / 4949.88 | 0 / 1022 | 0 / 427 | 78 / 427 |
+| `urma-piece-16mib-cc16-001` | 16 MiB | **5716.08** | **47.93** | 5596.63 / 5747.77 / 5808.03 | 0 / 235 | 0 / 122 | 12 / 122 |
+| `urma-piece32-001` | 32 MiB | **5761.32** | **48.33** | 5586.34 / 5790.86 / 5916.46 | 0 / 109 | 0 / 67 | 14 / 67 |
+| `urma-piece-64mib-cc16-001` | 64 MiB | **4963.44** | **41.63** | 4863.88 / 4869.73 / 5168.69 | 0 / 64 | 0 / 41 | 15 / 41 |
+| `urma-piece64-budget-001` | 64 MiB，扩大 TX/RX budget | **4544.09** | **38.12** | 4214.38 / 4698.78 / 4759.78 | 0 / 33 | 0 / 47 | 0 / 47 |
+
+4 MiB 增至 16 MiB 后 aggregate throughput 提升 19.03%；16 MiB 增至 32 MiB 只再提升 0.79%，已进入
+平台区。64 MiB 不仅没有继续提升，反而相对 32 MiB 下降 13.85%；扩大 budget 并消除 TX ring1 后仍下降，
+因此该回退不能归因于 TX registered budget。当前工程默认候选保留 16 MiB：它与 32 MiB 性能基本相同，
+但内存占用、尾延迟和调度粒度更稳妥；不再继续扩大 Piece。
+
+另做一组接近 demo 传输窗口的对齐实验：`urma-piece16-cc4-in64-001` 固定 16 MiB Piece、CC4、in64、
+pipe2、post1、MCT4、TX32/RX32。该 case PASS，aggregate 为 **5508.36 MiB/s（46.21 Gbps）**，
+min/median/max 为 5477.04/5514.65/5533.70 MiB/s；TX required/optional pressure 为 0/13，RX 为
+0/76，无 required wait、transport failure 或 fallback。其 native send depth 为 256，native receive depth
+为 512。虽然单 Piece 的 send/wait 和 total 时间更短，但因活跃 Piece 数从 16 降到 4，aggregate 比
+CC16/in16 低 3.63%；扩大单 Piece window 不能替代 Piece 间并发。
+
+### 12.5 接收端 `pwritev` 优化与新基线
+
+接收端原实现对每个 64 KiB span 单独调用 positional write。优化后，同一 receive window 的 spans 通过
+一次 `pwritev` 完整写入，正确处理 partial write、`EINTR`、零进展和 offset overflow；CRC32 并行以及
+window lease/recycle 生命周期保持不变。16 MiB Piece、in16 时，隐含 write syscall 数由每 Piece
+`16 windows x 16 spans = 256` 次降为 `16` 次，即减少 **16 倍**。
+
+使用与 12.4 的 16 MiB 基线相同参数（单 `dfget`、CC16、in16、post1、pipe2、1 warmup + 3 measured）
+运行 `urma-piece16-cc16-pwritev-001`：
+
+| 写路径 | aggregate MiB/s | Gbps | min / median / max MiB/s | 相对旧路径 |
+|---|---:|---:|---:|---:|
+| 逐 64 KiB positional write | 5716.08 | 47.93 | 5596.63 / 5747.77 / 5808.03 | 基准 |
+| receive-window `pwritev` | **7494.17** | **62.87** | 7438.46 / 7494.31 / 7550.58 | **+31.11%** |
+
+新 case 为纯 URMA PASS：TX required/optional pressure 为 0/236，RX 为 0/164，TX ring1 14 次、RX
+单窗 164 次；required RX wait、BUSY、session retirement、TCP fallback 和 previous-transfer failure 均为零。
+Child 样本均显示 `receive_window_count=16`、`pwrite_calls=16`；`pwrite_ns` 约 8.38--9.41 ms，旧路径约
+11.64--12.74 ms，下降约 27%；storage total 约 11.79--12.49 ms，旧路径约 15.20--17.25 ms，下降约
+25%。吞吐样本极差约 1.5%，收益稳定。
+
+该点说明接收端小粒度写 syscall 是此前明确的软件瓶颈，`pwritev` 结果从本节起作为新的 URMA E2E 基线。
+其 62.87 Gbps 高于 demo 8 GiB mmap file-to-file 的约 55.10 Gbps，但两者的文件大小、并发形态和计时边界
+不同，只能说明 Dragonfly Piece 路径已进入同一性能量级，不能直接宣称实现效率超过 demo。下一步按
+CC1/2/4/8/16/32 重跑完整单 `dfget` concurrency 曲线，确认峰值、平台点以及 CC16/CC32 的稳定性。
+
+### 12.6 `pwritev` 后单任务 Piece concurrency 曲线
+
+2026-09-03 使用 `pwritev` 接收写路径重跑完整曲线。固定单个 `dfget`、1 GiB 文件、16 MiB Piece、
+post1、pipe2、in16；每个 case 使用 1 次 warmup + 3 次 measured task。manifest task concurrency 均为
+1，表中的 CC 仍仅表示 `download.concurrentPieceCount`。所有 case 均 PASS；无 required TX/RX
+pressure、required RX wait、BUSY/reject、session retirement、TCP fallback 或 previous-transfer failure。
+
+| run | Piece concurrency | aggregate MiB/s | Gbps | 相对前一点 | 同 CC TCP MiB/s | 相对 TCP | TX opt / ring1 | RX opt / window1 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `urma-piece-16mib-cc1-post1-pipe2-001` | 1 | **2223.98** | **18.66** | — | 1581.77 | +40.60% | 0 / 0 | 0 / 0 |
+| `urma-piece-16mib-cc2-post1-pipe2-001` | 2 | **3290.99** | **27.61** | +47.98% | 2286.19 | +43.95% | 6 / 0 | 32 / 32 |
+| `urma-piece-16mib-cc4-post1-pipe2-001` | 4 | **5021.63** | **42.12** | +52.59% | 2530.39 | +98.45% | 16 / 0 | 176 / 176 |
+| `urma-piece-16mib-cc8-post1-pipe2-001` | 8 | **7100.04** | **59.56** | +41.39% | 2552.23 | +178.19% | 255 / 204 | 176 / 176 |
+| `urma-piece-16mib-cc16-post1-pipe2-001` | 16 | **7570.72** | **63.51** | +6.63% | 2553.02 | **+196.54%** | 230 / 14 | 152 / 152 |
+| `urma-piece-16mib-cc32-post1-pipe2-001` | 32 | **6762.88** | **56.73** | **-10.67%** | 2543.42 | +165.90% | 174 / 7 | 106 / 106 |
+
+曲线从 CC1 到 CC8 保持明显扩展，CC8 到 CC16 仅再增长 6.63%，CC32 则回退 10.67%。因此当前性能
+峰值和推荐配置为 **CC16：7570.72 MiB/s（63.51 Gbps）**；如优先控制资源消耗，可选择 CC8，吞吐为
+峰值的 93.78%。CC16 相对同 CC 的 25 Gbps TCP 基线达到 **2.97 倍**。该跨 transport 对照使用相同
+单任务/1 GiB/CC 口径，但 TCP 历史基线没有登记固定 16 MiB Piece，因此客户材料中应同时披露这一边界。
+
+新 CC16 相对 12.4 中相同 16 MiB Piece 的旧写路径 5716.08 MiB/s 提升 **32.45%**；相对 12.5 的
+首个 `pwritev` 单点 7494.17 MiB/s 高 1.02%，说明优化收益可以复现。CC32 在 optional pressure 更低且无
+required wait/failure 的情况下仍下降，排除 registered budget 和 transport fault 是主要原因。如果该组仍受
+`maxConcurrentTransfers=16` 限制，则 CC32 不会增加 lane 内有效 transfer 并发，只会增加 Piece 调度、
+文件写入和 CPU 竞争；应将其作为过并发点，而不是继续扩大 CC。
+
+各组首条 Piece 样本的 `pwrite_ns` 从 CC1/2/4 的约 1.31/1.36/1.67 ms，增至 CC8/16/32 的约
+7.33/7.09/13.77 ms；CC32 的方向性证据与文件写竞争假设一致。但这些只是每组首条日志，不代表总体
+分位数。下一步应对 CC8/16/32 全部 Piece 的 `rx_window_wait_ns`、`digest_ns`、`pwrite_ns` 和
+`storage_total_ns` 汇总 p50/p95/p99，并结合 CPU/completion profiling 定位平台与回退来源。
