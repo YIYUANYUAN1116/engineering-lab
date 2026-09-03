@@ -1,6 +1,6 @@
 # B7 真实 Provider 性能验证台账
 
-更新时间：2026-09-01。
+更新时间：2026-09-03。
 
 本文记录 Dragonfly URMA Phase B 在真实 provider、node1 parent / node2 child 环境中的性能实验。
 它只登记已经取得的实验数据、统计口径和由数据支持的结论；并发、多 peer、故障和 shutdown 结果在完成
@@ -271,3 +271,266 @@ RX pool 位于 parent process；每个 child 拥有独立 TX pool。case 均使�
    completion skew 增至 4.66 倍；这不是更充足的 RX admission，而是更多并发对等待的覆盖。
 7. **矩阵的性能排序仍需重复样本确认。** 当前四个预算点各只有一次 run；它们足以确认 correctness
    和 RX8/RX16 压力级别，但吞吐、公平性和 skew 的精确差异应至少再复跑 3 次后再作为稳定基线。
+
+## 8. 单 lane 并发 Piece 验证（B8.4）
+
+`b84-piece-c4-shutdownfix-001` 使用一个 Parent、一个 Child 和一条 persistent lane，同时启动 4 个
+独立 1 GiB task。每个 batch 从 Parent server 日志配对
+`start upload piece content over urma` 与 `urma piece finished on peer lane`，transfer identity 使用
+`(lane_id, transfer_id)`；只按 `transfer_id` 关联会在新 lane 从 1 重新分配后产生假 duplicate。
+
+以下 aggregate 按三个 measured batch 的总字节数除以总 makespan 计算；Jain 和 completion skew 为
+三批均值。warmup 不参与汇总。
+
+| run | task concurrency | lanes | max active transfers | max active tasks | 结果 | aggregate MiB/s | Gbps | mean Jain | mean completion skew |
+|---|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| `b84-piece-c4-shutdownfix-001` | 4 | 1 | **16** | **4** | **PASS** | **6157.46** | **51.65** | **0.999892** | **16.45 ms** |
+
+三个 measured batch 的明细为：
+
+| batch | makespan | aggregate MiB/s | Jain | completion skew | Piece start/completion | lane | overlap |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 1 | 647.81 ms | 6322.80 | 0.999828 | 20.99 ms | 619 / 619 | 1 | PASS |
+| 2 | 664.85 ms | 6160.79 | 0.999948 | 12.74 ms | 599 / 599 | 1 | PASS |
+| 3 | 682.96 ms | 5997.38 | 0.999901 | 15.63 ms | 595 / 595 | 1 | PASS |
+
+每批均满足：`laneCount=1`、`maxActiveTaskCount=4`、`maxActiveTransfers=16`、全部 task 有 Piece start、
+全部 transfer start/finish 配对，且 missing、duplicate、unfinished 均为 0。最终 manifest 为
+`state=passed`、`error=null`，Parent/Child 都由 owner gate 正常停止。
+
+第一轮 `b84-piece-c4-001` 的数据路径同样通过，但 Child 先退出时 Parent 记录
+`URMA incoming transfer queue is closed`，旧 shutdown analyzer 只放行 `early eof`，因此误报
+`stop-failed`。工具现仅在 shutdown offset 之后把这两类事件计为受控 peer close，并继续硬失败其他 CQE、
+completion、protocol、digest、Jetty 或 panic 错误；`shutdownfix` rerun 已验证该修复。
+
+### 8.1 数据支持的结论与边界
+
+1. **同一 persistent lane 的 Piece 生命周期并发成立。** 4 个 task 同时活跃，server 侧最多同时存在
+   16 个 transfer；这不是上层 task 并发后在 lane 上串行排队。
+2. **transfer identity 必须是 `(lane_id, transfer_id)`。** `transfer_id` 是 lane-local，并会在新 lane
+   上从 1 重新分配；工具已按复合 identity 统计 active、duplicate、finish 和 unfinished。
+3. **本轮 fairness 和完成偏斜稳定。** 三批 Jain 均高于 0.9998，平均 completion skew 为 16.45 ms；
+   aggregate 范围为 5997.38--6322.80 MiB/s。
+4. **本轮没有宣称同 lane native data window 并发。** manifest 明确记录
+   `nativeRxWindowConcurrencyClaimed=false`。当前 shared-JFR safety gate 仍限制同 lane 同时只有一个
+   native RX window outstanding；已证明的是 control/rendezvous、Storage 准备和 Piece lifecycle 并发。
+5. **下一 gate 是 completion 可验证的 native window concurrency。** 删除 safety gate 前必须先建立
+   sender 提供的 transfer/chunk identity（例如经过真实 provider 验证的 64-bit `SEND_IMM`），或实现等价的
+   lane-wide ordered send-ticket；不能仅依赖 RC SEND 消费 shared JFR 的 FIFO 顺序推断 Piece identity。
+
+## 9. SEND_IMM 真实 Provider 冒烟
+
+在 `udmac0d1e2` 上使用 UMDK `urma_perftest` 的 immediate-data 模式，对单 Jetty、RC、DUPLEX 路径完成
+SEND 带宽和时延冒烟：
+
+| test | bytes | iterations | 关键配置 | 结果 |
+|---|---:|---:|---|---|
+| `URMA_SEND BandWidth` | 65536 | 50000 | JFC depth 4096、JFS depth 128、CQ moderation 100 | peak **69444.85 MB/s**；average **67405.55 MB/s**；**1.078489 Mpps** |
+| `URMA_SEND Latency` | 64 | 10000 | JFC depth 512、JFS depth 1 | min **2.03 us**；median **2.16 us**；average **2.18 us**；p99 **2.41 us**；p99.9 **5.47 us**；max **8.00 us** |
+
+这两项证明真实 UDMA provider 的 RC `SEND_IMM` opcode 路径能够建连、传输并完成 CQE，且没有出现明显性能
+异常。它们不证明 receive CQE 中 64-bit immediate 的 high/low 32 位均被准确保留，也不证明 immediate 与
+payload、local receive `user_ctx` 的对应关系。最终 correctness gate 由 `tcp-urma-file-transfer` 分支新增的
+`send_imm_probe` 承担；在该探针双向通过前，不删除 Dragonfly shared-JFR safety gate。
+
+### 9.1 RC SEND_IMM 64-bit correctness probe
+
+`tcp-urma-file-transfer` 分支的 `send_imm_probe` 已在真实 provider 上完成 64 和 256 message 两个点。
+本轮方向均为 node2 `90.91.177.157` Child/SEND sender 到 node1 `90.91.177.158`
+Parent/RECV receiver：
+
+| messages | Child send retired | Parent receive CQE | distinct immediate | distinct RX slots | payload binding | CQE errors | 结果 |
+|---:|---:|---:|---:|---:|---|---:|---|
+| 64 | 64 | 64 | 64 | 64 | PASS | 0 | **PASS** |
+| 256 | 256 | 256 | 256 | 256 | PASS | 0 | **PASS** |
+
+两个点均报告 `transportMode=RC`，sender opcode 为 `SEND_IMM`，receiver opcode 为
+`SEND_WITH_IMM`，`full64BitIdentity=true`，所有 WR 正常完成并由 `Ready -> Closed` 退出。
+探针包含 high/low 32 位均非零的固定值和四个交错 transfer namespace，因此本轮已经证明：
+
+1. 该方向的 receive CQE 能完整保留 64-bit immediate；
+2. local RX slot 与 sender-provided identity 能够独立取得；
+3. payload 可以按 immediate 精确路由，且无 duplicate、missing、unknown 或 slot reuse；
+4. 256 条同时预投递的 shared-JFR receive WR 和 SEND_IMM completion 能完整 drain。
+
+node2 重启导致反向 node1 sender 到 node2 receiver 暂未执行。该缺口不阻塞 Dragonfly 的
+feature-gated/shadow 接入，但在反向通过前，不能把 `SEND_IMM` 标为双向 provider validation 完成，也不能
+据此删除 shared-JFR safety gate 或宣称 native RX window concurrency 已验证。
+
+## 10. 单 lane native RX window 与并发 Piece（B8.6）
+
+2026-09-03 在一个 Parent、一个 Child、一条 persistent lane 上完成 `post1-in32` 的 native RX window
+并发 correctness 验证。每个 fast run 使用一个 measured batch；C2 每批传输 2 GiB，C4 每批传输 4 GiB。
+runner 同时验证：
+
+- Parent server 的 Piece start/finish 使用 `(lane_id, transfer_id)` 完整配对；
+- Child 的 native RX admission/release 使用
+  `(lane_id, transfer_id, window_start_chunk)` 完整配对；
+- 同 lane 至少两个不同 transfer 的 native RX window 同时 outstanding；
+- SEND_IMM window 与 Piece 汇总一致，允许 provider 保持同 transfer 匹配，因此
+  `crossTransferChunkCount` 只作为观测值，不作为并发必要条件；
+- 无 BUSY/reject、session retirement、TCP fallback 或 previous transfer failure。
+
+修复后的四个 fast correctness 点如下。前三组粘贴摘要未附 manifest run ID，故暂以重复序号登记；最后一组
+明确为 `b86-fast-c4-002`，归档 manifest 后应回填其余 ID。
+
+| run | task concurrency | 结果 | aggregate MiB/s | Gbps | Jain | completion skew | TX required pressure | TX optional pressure | RX required pressure | RX optional pressure | required RX wait count | required RX wait total | retire | TCP fallback |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| C2 fast repeat 1 | 2 | **PASS** | **6542.06** | **54.88** | 0.999981 | 2.76 ms | 0 | 512 | 0 | 167 | 0 | 0 ms | 0 | 0 |
+| C2 fast repeat 2 | 2 | **PASS** | **6355.50** | **53.31** | 1.000000 | 0.12 ms | 0 | 511 | 0 | 134 | 0 | 0 ms | 0 | 0 |
+| C4 fast repeat 1 | 4 | **PASS** | **8162.41** | **68.47** | 0.999789 | 17.72 ms | 0 | 759 | 0 | 115 | 3 | 4.70 ms | 0 | 0 |
+| `b86-fast-c4-002` | 4 | **PASS** | **7200.44** | **60.40** | 0.999888 | 15.34 ms | 0 | 696 | 0 | 91 | 28 | 104.18 ms | 0 | 0 |
+
+两次 C2 aggregate 均值为 6448.78 MiB/s，范围为 6355.50--6542.06 MiB/s；两次 C4 aggregate 均值为
+7681.42 MiB/s，范围为 7200.44--8162.41 MiB/s。C4 均值比 C2 高 19.12%，但 C4 两次结果相差
+11.79%，且每个 fast run 只有一个 measured batch，因此这些数字是 correctness/performance smoke，尚不能
+替代 warmup + 三批以上 measured 数据形成的稳定性能基线。
+
+### 10.1 Aggregate queue-depth 根因与修复
+
+B8.6 首先暴露了两处“单 Piece window 深度”和“lane native queue depth”混用：
+
+1. `b86-fast-001` 中 Child 将 `maxInflightChunks=32` 同时用作单 window 大小和 JFR `recv_depth`。
+   一窗正好耗尽 32 个 RECV WR，1024 个 window 全部串行，表现为
+   `maxActiveWindows=1`、`maxActiveTransfers=1`、512 次 optional RX 单窗降级。修复后，单 window
+   仍为 32 chunks，而默认 RX32 预算下 aggregate native JFR depth 为 512，并由 per-lane semaphore
+   持有 credit 至对应 receive CQE 完成。
+2. `b86-fast-002` 在 RX 并发打开后，Parent 仍将单 window 的 32 chunks 用作 JFS `send_depth`。
+   多 transfer 同时 SEND 时真实 provider 返回
+   `post_jetty_send_imm_wr failed with status -12`（`ENOMEM`），随后共享 lane 关闭、Child 收到 connection
+   reset，aggregate 仅 68.07 MiB/s。修复后，单 TX window 仍为 32 chunks，而默认 TX8 预算下
+   aggregate native JFS depth 为 128，并由 per-lane semaphore 持有 credit 至全部 SEND CQE 完成。
+
+两侧 aggregate depth 均取 registered slot 数、provider JFR/JFS capability 和配置并发需求的最小值；
+required window 等待 native credit，optional pipeline window 在预算不足时受控退化。provider 在 admission
+成功后若仍返回 `ENOMEM`，仍按 transport invariant 破坏 fail closed，不能降级成普通 Piece BUSY。
+
+### 10.2 数据支持的结论与边界
+
+1. **同 lane native RX window concurrency 已成立。** 四个修复后 fast run 均通过 admission 生命周期、
+   SEND_IMM routing 和 Piece overlap gate，不再只是上层 Piece/control 生命周期并发。
+2. **JFR/JFS aggregate admission 消除了 provider overflow。** 四组均无 native post error、session retire
+   和 TCP fallback；`required pressure=0` 表明 required TX/RX window 最终都取得资源。
+3. **optional pressure 是受控 pipeline 退化。** TX optional pressure 为 511--759，RX optional pressure为
+   91--167，但没有被放大为 lane failure或 TCP fallback。日志行计数只覆盖特定降级消息，不要求与
+   Prometheus optional pressure counter 一一相等。
+4. **C4 已进入可见的 RX required 等待区。** 两次 C4 分别出现 3 次/4.70 ms 和 28 次/104.18 ms
+   required RX wait；均未超时，但第二次吞吐比第一次低 11.79%，后续稳定性能测试必须同时采集 wait 指标。
+5. **B8.4 的旧边界已经被 B8.6 取代。** 第 8.1 节记录的
+   `nativeRxWindowConcurrencyClaimed=false` 只描述当时的 `b84-piece-c4-shutdownfix-001`，不得继续作为
+   当前实现能力判断。
+
+### 10.3 三批次稳定基线
+
+在 fast correctness 点通过后，以 1 次 warmup + 3 个 measured batch 复测 C2/C4。两组均通过完整的
+Piece lifecycle、native RX admission 和 SEND_IMM routing gate；全部 18 GiB measured data 无
+BUSY/reject、session retirement、TCP fallback 或 previous-transfer failure。
+
+| run | task concurrency | measured data | 结果 | aggregate MiB/s | Gbps | Jain | mean completion skew | TX required / optional pressure | RX required / optional pressure | required RX wait count / total | TX ring1 fallback | RX window1 fallback |
+|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `b86-native-rx-stable-c2-001` | 2 | 6 GiB | **PASS** | **6494.90** | **54.48** | 0.999525 | 11.93 ms | 0 / 2038 | 0 / 559 | 0 / 0 ms | 25 | 559 |
+| `b86-native-rx-stable-c4-002` | 4 | 12 GiB | **PASS** | **8335.11** | **69.92** | 0.999738 | 18.76 ms | 0 / 2892 | 0 / 446 | 6 / 111.20 ms | 0 | 446 |
+
+C4 aggregate throughput 比 C2 高 28.33%，同时保持 Jain fairness 大于 0.9995。C4 的 6 次 required RX
+wait 合计 111.20 ms，平均每次 18.53 ms，但没有 required pressure、timeout 或 fallback；这说明 RX
+required admission 已经成为可观测的延迟来源，尚未构成 correctness 或 transport stability 问题。
+两组大量 optional pressure 和 RX 单窗退化说明第二 pipeline window 经常拿不到预算；它们是后续资源配置
+和吞吐优化的直接观测项，不能误报为传输失败。
+
+`b86-native-rx-stable-c4-001` 的内容传输和 transport diagnostics 正常，但 runner 在 Parent 最后一个
+finish 日志落盘前截取 batch 尾边界，误报一个 unfinished transfer；修复为在下一 batch 启动前有界等待
+完整 lifecycle 后，`c4-002` 正式通过。因此 `c4-001` 不作为 PASS 基线登记。
+
+## 11. TCP 单任务 Piece concurrency 基线
+
+2026-09-03 在 25 Gbps 网卡环境完成 TCP 对照测试。这里的 `CC` 是单个 `dfget` 内的
+`download.concurrentPieceCount`，不是并发 `dfget` 数量；所以 manifest 的 task concurrency 均为 1。
+每个 case 使用 1 GiB 文件、2 次 warmup 和 5 次 measured task，其他参数固定为 `post1-pipe2-in16`。
+
+| run | Piece concurrency | 结果 | measured data | aggregate MiB/s | Gbps | 25 Gbps 利用率 |
+|---|---:|---|---:|---:|---:|---:|
+| `tcp-piece-cc1-001` | 1 | **PASS** | 5 GiB | **1581.77** | **13.27** | 53.08% |
+| `tcp-piece-cc2-001` | 2 | **PASS** | 5 GiB | **2286.19** | **19.18** | 76.72% |
+| `tcp-piece-cc4-001` | 4 | **PASS** | 5 GiB | **2530.39** | **21.23** | 84.91% |
+| `tcp-piece-cc8-001` | 8 | **PASS** | 5 GiB | **2552.23** | **21.41** | 85.64% |
+| `tcp-piece-cc16-001` | 16 | **PASS** | 5 GiB | **2553.02** | **21.42** | 85.67% |
+| `tcp-piece-cc32-001` | 32 | **PASS** | 5 GiB | **2543.42** | **21.34** | 85.34% |
+
+由 CC1 到 CC4，aggregate throughput 从 1581.77 MiB/s 增长到 2530.39 MiB/s，增幅 59.97%；
+CC4 到 CC16 只再增长 0.89%，CC32 相对 CC16 下降 0.38%。因此当前 TCP 路径在 CC4 后已经进入平台区，
+CC8--CC16 可视为该环境下的有效饱和点。25 Gbps 的理论单向带宽为 2980.23 MiB/s，最佳实测
+2553.02 MiB/s（21.42 Gbps），线速利用率为 85.67%。
+
+对应 URMA 对照见第 12 节。不得将 B8.6 的 C2/C4 多 `dfget` 同 lane 并发结果与本表直接作倍率比较。
+
+## 12. URMA 单任务 Piece concurrency 基线
+
+2026-09-03 按第 11 节相同口径完成 URMA CC1/2/4/8/16/32 对照：单个 `dfget`、1 GiB 文件、
+`post1-pipe2-in16`，每个 case 使用 2 次 warmup 和 5 次 measured task。manifest 的 task concurrency
+仍为 1；CC 只表示 `download.concurrentPieceCount`。
+
+| run | Piece concurrency | 结果 | measured data | aggregate MiB/s | Gbps | 同 CC TCP MiB/s | 相对 TCP |
+|---|---:|---|---:|---:|---:|---:|---:|
+| `urma-piece-cc1-001` | 1 | **PASS** | 5 GiB | **1670.79** | **14.02** | 1581.77 | +5.63% |
+| `urma-piece-cc2-001` | 2 | **PASS** | 5 GiB | **2568.31** | **21.54** | 2286.19 | +12.34% |
+| `urma-piece-cc4-001` | 4 | **PASS** | 5 GiB | **3997.11** | **33.53** | 2530.39 | +57.96% |
+| `urma-piece-cc8-001` | 8 | **PASS** | 5 GiB | **5159.93** | **43.28** | 2552.23 | +102.17% |
+| `urma-piece-cc16-001` | 16 | **PASS** | 5 GiB | **4765.83** | **39.98** | 2553.02 | +86.67% |
+| `urma-piece-cc32-001` | 32 | **PASS** | 5 GiB | **5497.07** | **46.11** | 2543.42 | +116.13% |
+
+### 12.1 数据支持的结论与边界
+
+1. **URMA 的并发扩展明显强于 TCP。** CC1 到 CC8 依次增长 53.72%、55.63% 和 29.09%；CC8 已达到
+   同 CC TCP 的 2.02 倍，CC32 达到 2.16 倍。
+2. **当前最佳单任务点为 CC32。** 5497.07 MiB/s（46.11 Gbps）已经超过 25 Gbps TCP 网卡线速，
+   因此 25 Gbps 只能作为 Ethernet/TCP 基线，不能作为 `udmac0d1e2` URMA fabric 的带宽上限。
+3. **曲线尚不能解释为链路饱和。** CC8 到 CC16 下降 7.64%，CC16 到 CC32 又增长 15.34%；这种非单调
+   变化更符合 admission、Piece 调度或 run-level 波动，而不是平滑进入固定链路上限。
+4. **默认 TX8 曾是首要待验证边界。** `in16` 下一个 required window 为 1 MiB，8 MiB TX pool 理论上只能
+   同时容纳 8 个 required window；后续正交结果已排除它是主要吞吐瓶颈，见 12.2 节。
+5. **本轮原始 sweep 的 diagnostics 尚未取得。** 用户提供的摘要中 diagnostics 为 `null`，不能据此宣称
+   pressure、wait、ring/window 退化或 fallback 均为零。后续正交 run 已通过
+   `.result.urmaDiagnostics` 完整采集这些字段。
+
+### 12.2 TX、pipeline 与 transfer cap 正交结果
+
+后续 case 固定单 `dfget`、1 GiB、`in16`，每组 2 次 warmup + 3 次 measured task；所有 run 均为纯
+URMA PASS，无 required pressure、session retirement、TCP fallback 或 previous-transfer failure。
+
+| 配置 | aggregate MiB/s | Gbps | 关键诊断/结论 |
+|---|---:|---:|---|
+| CC8 / post1 / pipe2 / TX16 | 4418.19 | 37.06 | TX optional 314，RX optional 404，无 required wait |
+| CC16 / post1 / pipe2 / TX16 | 4640.07 | 38.92 | TX optional 901，130 次 ring1；RX optional 476 |
+| CC16 / post1 / pipe2 / TX32 | 4662.01 | 39.11 | TX optional 降至 420、ring1 清零，但吞吐仅比 TX16 高 0.47% |
+| CC8 / post8 / pipe2 / TX16 | 5127.73 | 43.01 | 比同配置 post1 高 16.06% |
+| CC16 / post8 / pipe2 / TX32 | 4903.91 | 41.14 | 比同配置 post1 高 5.19% |
+| CC16 / post1 / pipe1 / TX16 | 4594.55 | 38.54 | 所有 optional pressure 清零；仅比 pipe2 低 0.98% |
+| CC32 / post8 / pipe1 / MCT16 / TX32 | 4954.88 | 41.56 | 所有 pressure 为零 |
+| CC32 / post8 / pipe1 / MCT32 / TX32 | 4574.61 | 38.37 | 所有 pressure 为零；比 MCT16 低 7.67% |
+
+这些数据排除了 registered TX pool、第二 pipeline ring 和 MCT16 cap 是当前主要瓶颈。TX32 虽能消除
+ring1 降级，但未转化为吞吐；pipe1 在高 Piece concurrency 下已能依靠 transfer 间并行保持数据面忙碌；
+MCT32 只增加软件竞争。post8 在 CC8/CC16 的局部对照中有收益，因此继续做严格 post-list sweep。
+
+### 12.3 CC32 post-list 单变量 sweep
+
+固定 CC32、pipe1、in16、MCT16、TX32、RX32，只改变 `postListSize`。每组为 2 次 warmup + 3 次
+measured task，全部 PASS，且 TX/RX required/optional pressure、admission wait、ring/window 降级、
+BUSY、session retirement 和 TCP fallback 均为零。
+
+| run | post-list | aggregate MiB/s | Gbps | min / median / max MiB/s | 相对 post1 |
+|---|---:|---:|---:|---:|---:|
+| `urma-piece-cc32-post1-001` | 1 | **5409.58** | **45.38** | 5311.40 / 5407.14 / 5513.98 | 基准 |
+| `urma-piece-cc32-post4-001` | 4 | **5379.34** | **45.13** | 5323.96 / 5391.72 / 5423.29 | -0.56% |
+| `urma-piece-cc32-post8-001` | 8 | **4684.68** | **39.30** | 4225.96 / 4944.68 / 4962.42 | -13.40% |
+| `urma-piece-cc32-post16-001` | 16 | **5023.97** | **42.14** | 4943.68 / 4979.04 / 5154.20 | -7.13% |
+
+post1 是本轮最快点，post4 与其只差 0.56%；post8 的 min--max 范围达到 736.46 MiB/s，明显比其他点
+抖动，并导致 aggregate 比 post1 低 13.40%。post16 相比 post8 恢复 7.24%，但仍比 post1 低 7.13%。
+因此在 CC32/pipe1 多 transfer 已充分并行时，WR list batching 没有稳定收益，不能将 post8 直接设为全局
+默认值。它与 12.2 节 CC8/CC16 的正收益共同说明 post-list 效果依赖并发形态；下一步应转向
+transport-only 与 CRC32+write 分层基准以及 CPU/completion profiling，而不是继续扩大 post-list。
+
+UMDK 64 KiB SEND microbenchmark 的平均值为 67405.55 MB/s，而本组最佳 E2E 约为 5764 MB/s，仅相当于
+裸 SEND 数值的约 8.55%。该比例只用于说明仍有优化空间，不能作为等价效率指标：Dragonfly E2E 额外包含
+Piece 调度、控制协议、CRC32、文件读写和完成物化等开销。
