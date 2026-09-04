@@ -1,7 +1,13 @@
 # Dragonfly URMA 真实 Provider 验证 Runbook
 
-更新日期：2026-08-30。本文只把真实 UMDK provider 结果标记为实验证据；编译、mock
+更新日期：2026-09-04。本文只把真实 UMDK provider 结果标记为实验证据；编译、mock
 或本地故障注入不等价于真机验证。
+
+> 当前执行状态：B5/B6 正常路径、budget pressure、多 lane required-first admission，以及 B8 同 lane
+> 并发 Piece/native RX window 已完成真实 provider 验证；`pwritev` 后单任务峰值为 63.51 Gbps，
+> L8/CC8/TX128 的纯 URMA 均值为 134.25 Gbps。第 5 节的矩阵保留为历史验证方法，不再表示 B5/B6
+> “尚未开始”。下一轮先用当前 binary 新增的 TX window acquire timing 重跑 L8/TX128，再按证据优化
+> allocator；同时补齐反向 SEND_IMM probe 和第 7 节 outstanding/fault shutdown 矩阵。
 
 B7 自动化工具位于 `tools/urma-b7/`：`discover/plan` 负责只读发现和拓扑冻结，
 `prepare/run/cleanup` 默认 dry-run，只有显式 `--execute` 才操作远端。执行路径使用 run-scoped
@@ -37,7 +43,7 @@ cargo build --release -p dragonfly-client \
   --features urma --bin dfdaemon --bin dfget
 ```
 
-中途失败验证必须显式构建验证 feature：
+中途失败验证或 transport-only 分层基准必须显式构建验证 feature：
 
 ```bash
 cargo build --release -p dragonfly-client \
@@ -45,12 +51,29 @@ cargo build --release -p dragonfly-client \
 ```
 
 `urma-test-failpoints` 会传递到 storage crate 并自动包含 `urma`。只启用 `urma` 的
-二进制不会读取 failpoint 环境变量。两节点上保留：
+二进制不会读取 failpoint 或 `DF_URMA_PERFORMANCE_PROFILE` 环境变量。两节点上保留：
 
 ```bash
 sha256sum dfdaemon dfget
 ldd dfdaemon | grep -E 'urma|not found'
 ```
+
+### 2.1 24 GiB 分层吞吐对照
+
+B7 已提供两个同参数 case：
+
+- `fanout-piece16-cc8-post1-in16-l8-tx128-transport-only-tmpfs`；
+- `fanout-piece16-cc8-post1-in16-l8-tx128-crc32-pwrite-tmpfs`。
+
+两者都是 L8、每 lane CC8、3 个 measured batch × 8 GiB，总传输量 24 GiB，并强制 storage 位于
+tmpfs。transport-only 仍验证 SEND_IMM/CQE、精确长度、Done 和 lease recycle，但刻意跳过 Child CRC32
+和 pwrite，输出不能用于 SHA 完整性结论；runner 会要求每个 1 GiB/16 MiB task 恰有 64 个 profile
+completion。正常 case 必须继续满足 origin/Parent/Child SHA 一致。
+
+执行每组前检查 `df -h /dev/shm`，执行后立即按 manifest cleanup；A/B 至少交替两轮，不能把连续未
+cleanup 的结果放入同一比较。PR #1945 的 RDMA concurrency 是单个共享 `FI_EP_RDM` endpoint 上的
+并发 Piece，不是多 lane，因此 L8×CC8 只回答 URMA 的总饱和能力；公平机制对照还需使用单 lane 多
+Piece case。
 
 ## 3. dfdaemon 配置
 
@@ -244,9 +267,10 @@ grep -E 'piece_number=256|length 12345|piece_id=.*-256' /tmp/dfdaemon-child.log
 grep -E 'piece_number=256|length 12345|piece_id=.*-256' /tmp/dfdaemon-parent.log
 ```
 
-## 5. B5/B6 批处理与注册预算验证
+## 5. B5/B6 批处理与注册预算验证（已执行的基础矩阵）
 
-B5/B6 尚未在真实 provider 上验证。先用默认兼容基线跑 correctness，再逐项只改一个变量：
+B5/B6 的基础矩阵和后续 required-first admission 已在真实 provider 上完成。以下表格保留为复现与扩展
+矩阵；新增 case 仍应先跑默认兼容基线，再逐项只改一个变量：
 
 | 组 | `postListSize` | `pipelineDepth` | 注册预算 | 目的 |
 |---|---:|---:|---|---|
@@ -259,7 +283,22 @@ B5/B6 尚未在真实 provider 上验证。先用默认兼容基线跑 correctne
 
 `maxRegisteredBytes` 是 process 预注册总量；`txRegisteredBytes` 是固定 TX 分区，RX 使用余量。两者按
 64 KiB slot 向下换算，且 TX/RX 各至少一个 slot。`pipelineDepth=2` 时，单 window 最大 slot 数是方向
-slot 数的一半；这不是同一 lane 并发多个 Piece，同一 persistent Session 仍顺序处理 Piece。
+slot 数的一半。B6 初测时同一 persistent Session 仍顺序处理 Piece；B8 已通过 transfer multiplexing 和
+`SEND_IMM` identity 支持同 lane 并发 Piece，不能再用这一历史限制解释当前结果。
+
+### 5.1 B8 与当前性能复测要求
+
+当前并发性能 case 必须额外验证：
+
+- Piece identity 使用 `(lane_id, transfer_id)`；native RX window identity 使用
+  `(lane_id, transfer_id, window_start_chunk)`；
+- 同 lane 至少两个 transfer 的 native RX window 同时 outstanding，SEND_IMM window/Piece 汇总闭合；
+- JFR/JFS aggregate depth、native permits、required/optional pressure、ring/window1 fallback 均入档；
+- L8/CC8/TX128 复测必须每轮保存 evidence 后执行 manifest-owned cleanup，并交替运行 A/B，避免遗留
+  storage 目录、公共 seed hard link 和主机负载污染趋势；
+- 当前 HEAD 还必须汇总 `tx_required_acquire_ns`、`tx_required_pool_acquire_ns`、
+  `tx_optional_acquire_ns` 和 `tx_optional_pool_acquire_ns` 的 count/mean/p50/p95/p99/max，以区分 owner
+  command 排队和 allocator 本体成本。
 
 每一组至少覆盖：非整 chunk 尾部、连续 10 Piece、normal/persistent/persistent-cache、mmap 与 reader
 fallback。post-list 组还必须注入或构造 partial post、单 WR error、flush/断链，确认只消费成功提交前缀，

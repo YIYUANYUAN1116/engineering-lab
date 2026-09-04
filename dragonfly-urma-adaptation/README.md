@@ -25,6 +25,7 @@ B7 自动化工具位于 [`tools/urma-b7/`](tools/urma-b7/README.md)，支持双
 7. [真实 Provider 验证 Runbook](./real-provider-validation-runbook.md)
 8. [Phase B：URMA production 性能数据路径](./phase-b-performance-data-path.md)
 9. [B7 真实 Provider 性能验证台账](./b7-real-provider-performance-ledger.md)
+10. [URMA RM 是否更适合 Dragonfly P2P：连接模型与演进评估](./urma-rm-for-dragonfly-p2p-evaluation.md)
 
 ## 证据口径
 

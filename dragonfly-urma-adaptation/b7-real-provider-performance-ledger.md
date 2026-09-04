@@ -1,12 +1,30 @@
 # B7 真实 Provider 性能验证台账
 
-更新时间：2026-09-03。
+更新时间：2026-09-04。
 
 本文记录 Dragonfly URMA Phase B 在真实 provider、node1 parent / node2 child 环境中的性能实验。
 它只登记已经取得的实验数据、统计口径和由数据支持的结论；并发、多 peer、故障和 shutdown 结果在完成
 前不得从本台账中的单流结果外推。
 
-## 1. 当前有效基线
+## 0. 当前状态摘要
+
+- B8 核心数据路径已完成：同一 persistent lane 的并发 Piece、64-bit `SEND_IMM` 路由、native RX
+  window concurrency，以及 aggregate JFR/JFS admission 均已在目标方向通过真实 provider 正常路径；
+- `pwritev` 后单任务当前峰值为 CC16 的 7570.72 MiB/s（63.51 Gbps）；
+- 多 lane 当前最佳纯 URMA 点为 L8/每 lane CC8/TX128 MiB，两次均值 16003.86 MiB/s
+  （134.25 Gbps），距 400 Gbps 仍需约 2.98 倍；
+- 裸 `urma_perftest SEND_IMM` 平均约 539.24 Gbps，说明 400 Gbps 在 transport 层存在硬件空间，但不构成
+  Dragonfly E2E 承诺；
+- TX160 未改善吞吐，第二 pipeline ring、registered TX budget、继续增大 Piece 和高并发 post-list 已被
+  当前数据排除为首要瓶颈；
+- 当前 HEAD 已记录 TX required/optional window 的总 acquire 和 pool 本体耗时，工具也已支持汇总。
+  下一验证点是在严格 cleanup、交替 A/B 的 L8/TX128 基线上量化 allocator；在取得该数据前，不把
+  allocator 认定为唯一根因。
+
+仍未闭环：完整 fault/outstanding shutdown 矩阵、SEND_IMM 反向 probe、多物理 Child 扩展，以及
+transport-only、owner/CQ、CPU/NUMA、CRC32/Storage 的分层 profile。
+
+## 1. 初始单 lane 有效基线（历史）
 
 ### 1.1 环境与负载
 
@@ -152,9 +170,9 @@ aggregate          990.12 MiB/s
 路径。早期 selected-evidence 汇总还曾混入 preheat/双方日志，人工按角色核对后 parent 正常 Piece 数为
 256；后续工具已修复 evidence 作用域和 warmup/preheat 顺序。
 
-## 4. 当前数据支持的结论
+## 4. 初始单 lane 矩阵支持的结论（历史）
 
-1. **当前单流最优为 `post8-in64`。** E2E aggregate 为 2410.47 MiB/s，mean Piece gap 为
+1. **该初始矩阵的单流最优为 `post8-in64`。** E2E aggregate 为 2410.47 MiB/s，mean Piece gap 为
    1.504 ms。
 2. **`postListSize` 与 inflight/window 形态强耦合。** post8 相对 post1 在 in16 下退化约 11.6%，
    在 in32 下提升约 4.5%，在 in64 下提升约 42.9%，不能把 post8 视为所有窗口形态的固定最优值。
@@ -162,17 +180,17 @@ aggregate          990.12 MiB/s
    Piece 恰为一个 window，ring=1，TX fill 与 SEND 无跨 window overlap。
 4. **post8-in64 显著压低单窗口发送开销。** 相比 post1-in64，其 TX Piece total 从 2.085 ms 降到
    1.411 ms，CQE wait 从 0.641 ms 降到 0.318 ms，mean gap 从 2.172 ms 降到 1.504 ms。
-5. **当前单流优化重点在稳态 TX。** `post8-in64` 的 TX fill 为 0.808 ms，占 TX Piece total 的主要
+5. **该初始单流矩阵的优化重点在稳态 TX。** `post8-in64` 的 TX fill 为 0.808 ms，占 TX Piece total 的主要
    部分；RX Storage total 为 0.940 ms，低于 TX Piece total 和 completion gap。
 6. **不继续把单流细调作为并发前置。** post4/16/32 sweep 可在并发结果表明仍由 batching 限制时再做；
    当前应进入同 lane 排队、TX fan-out 和 RX fan-in 验证。
 
-## 5. 并发阶段前的基线与待验证假设
+## 5. 并发阶段前的基线与待验证假设（历史）
 
 并发测试保留两个单流对照：
 
 - 控制组：`post1-in32`，1958.40 MiB/s；
-- 当前优化候选：`post8-in64`，2410.47 MiB/s。
+- 当时的优化候选：`post8-in64`，2410.47 MiB/s。
 
 默认 slot size 为 64 KiB，TX 预算为 8 MiB（128 slots），RX 预算为 32 MiB（512 slots）。
 `post8-in64` 的一个 4 MiB Piece 首窗口需要64个 slots，因此数据产生以下待验证假设：
@@ -728,3 +746,31 @@ Piece，比单纯增加 lane 更高效；多 lane 的主要价值是跨独立 pe
 `.result.fanoutDiagnostics`，所以输出中的 `null` 不表示相关计数为零。L2 当前 manifest 已进入
 `cleaned` 生命周期状态。表中保留其 transfer summary，但在未补取/确认 `fanoutValidation` 和
 `fanoutDiagnostics` 前，不额外宣称该点具有零 fallback/零 retirement 证据。
+
+### 12.10 清理敏感性与 24 GiB 分层 profile（2026-09-04）
+
+同一 L8/CC8/TX128 形态的两次人工测试再次出现明显清理敏感性：未清理旧 run 数据时为
+10747.36 MiB/s（90.16 Gbps），清理后为 15359.62 MiB/s（128.85 Gbps），后者高 42.92%。两轮 TX
+required pool acquisition mean 分别约为 17.99 us 和 17.64 us，pool bookkeeping 只占 required
+acquire duration 的约 5.5% 和 5.2%；高吞吐轮反而观察到更多 optional pressure/ring1 fallback。因此
+这组数据不能支持“TX allocator 或 ring 可用率导致清理差值”，更像 filesystem/page cache/writeback
+或其他 host-state 污染。该测试未形成完整 manifest-owned 清理闭环，只作为复现实验动机，不并入
+12.8 的稳定基线。
+
+为把 transport 和 Storage 层拆开，现已增加两个尚待真机执行的 B7 case：
+
+| case | lane × per-lane Piece CC | 数据量 | Child 行为 | 完整性门禁 | 当前状态 |
+|---|---:|---:|---|---|---|
+| `fanout-piece16-cc8-post1-in16-l8-tx128-transport-only-tmpfs` | 8 × 8 | 24 GiB | drain registered RX window；跳过 CRC32/pwrite | Parent SHA + 两端长度 + lifecycle + 每 task 64 个 profile completion | runner ready，待真机 |
+| `fanout-piece16-cc8-post1-in16-l8-tx128-crc32-pwrite-tmpfs` | 8 × 8 | 24 GiB | 正常 receive-window CRC32+pwrite | origin/Parent/Child SHA | runner ready，待真机 |
+
+两组均固定 16 MiB Piece、post1、pipe2、in16、MCT80、TX128 MiB + RX32 MiB，并把 Parent/Child
+storage/output 放到经 `stat -f` 验证的 `/dev/shm`。transport-only 只存在于
+`urma-test-failpoints` validation build，生产 `--features urma` 不读取该 profile；其 Child 输出是
+预分配的无效内容，绝不能当作 correctness artifact。
+
+PR #1945 的连接结构已从源码确认：一个 daemon 进程创建一个共享 `FI_EP_RDM` endpoint、共享 CQ 和
+progress thread；每个 Piece 单独建立 TCP rendezvous，并以独立 tag 在该共享 endpoint 上传输。因此
+其 concurrency=1..32 是“单 endpoint 多 Piece”，不是多 lane/QP。上述 L8×CC8 profile 用于寻找 URMA
+总饱和上限；要和 RDMA 曲线解释同一并发维度，还必须另跑单 persistent lane 的 Piece CC sweep，并在
+报告中同时写明 lane count 与 per-lane CC。

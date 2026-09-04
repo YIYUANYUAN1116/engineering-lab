@@ -1,6 +1,12 @@
 # RDMA/URMA 上传下载路径对比与进度台账
 
-更新时间：2026-08-29。
+更新时间：2026-09-04。
+
+> 当前状态：B1-B6 production path 已完成，B8 已完成同 lane 并发 Piece、`SEND_IMM` identity、native
+> RX window concurrency 和 aggregate JFR/JFS admission；receive-window `pwritev` 已进入新基线。
+> 单任务当前峰值为 63.51 Gbps，8 lane/每 lane CC8/TX128 MiB 的两次纯 URMA 均值为 134.25 Gbps。
+> 下表中保留的“真机待验”若带有早期工作包语境，仅代表当时状态；当前仍未闭环的是完整 fault/shutdown、
+> SEND_IMM 反向 probe、多物理 peer，以及面向 400 Gbps 的分层性能定位。
 
 ## 1. 结论
 
@@ -18,6 +24,12 @@
 - URMA/liburma：process-level Runtime/JFC/Segment，per-peer RC Jetty；一个 TCP control connection
   和 Jetty 顺序复用多个 Piece。
 
+`[PR #1945 源码确认，2026-09-04]` RDMA 性能表的 concurrency=1/2/4/8/16/32 表示一个 daemon
+进程内、同一个 `FI_EP_RDM` endpoint 上的并发 Piece；这些 Piece 共享 CQ 和 progress thread，以独立
+tag 路由 bulk transfer。每个 Piece 虽各自建立 TCP rendezvous，但没有各自创建 endpoint/QP，因此该表
+不是 multi-lane 曲线。URMA 最接近的结构对照是一个 persistent lane 内多 Piece；URMA 的
+`多 lane × 每 lane 多 Piece` 是额外扩展维度，报告时必须同时给出 lane 数和 per-lane Piece CC。
+
 URMA 已完成 native/Fabric/lane/session、client/server adapter、discovery/readiness、dfdaemon wiring、
 三类 Piece fallback，以及 Phase B B1-B4 RX/TX production 数据路径。demo 只提供已验证的 URMA
 provider/WR/lease 实现依据；Dragonfly 没有迁移 demo 的独立文件协议、benchmark CLI 或 application
@@ -27,7 +39,8 @@ provider/WR/lease 实现依据；Dragonfly 没有迁移 demo 的独立文件协�
 额外 userspace staging copy。transport-neutral `Downloader` 兼容调用仍保留一次 lease -> `Bytes`
 聚合 copy，但 `piece.rs` 的三类 production 路径不走该入口。当前 production TX 是
 `MappedPiece/RangeReader -> registered TX spans -> NIC DMA`，没有 owned window 或逐 chunk payload
-copy。B1-B4 尚未进行真实 provider 跨节点验证。
+copy。B1-B4 的正常、尾部、并发和预算退化路径已在后续真实 provider 跨节点实验中持续覆盖；完整
+fault/outstanding shutdown 矩阵仍待补齐。
 
 ## 2. 下载路径
 
@@ -48,16 +61,16 @@ Piece::download_piece_from_parent
 
 | 链路阶段 | RDMA production path | URMA 当前对应 | 状态 |
 |---|---|---|---|
-| Piece 协议选择和 TCP fallback | `resource/piece.rs` | 三类 Piece 优先走 URMA direct reader；失败 reset 后 TCP 整块重下 | 已完成，真机待验 |
+| Piece 协议选择和 TCP fallback | `resource/piece.rs` | 三类 Piece 优先走 URMA direct reader；失败 reset 后 TCP 整块重下 | 正常路径真机 PASS；完整 fault matrix 待补 |
 | capability discovery/cache/backoff | `RDMADownloader` + `discover` | `URMADownloader` + `discover` | 已完成 |
 | process fabric 初始化/失败退休 | `RDMADownloader::fabric` | `URMADownloader::fabric` + `UrmaFabric::get_or_start` | 已完成 |
 | peer connection | 每 Piece TCP rendezvous | per-parent cached client、persistent Session/lane | Phase A normal 真机已确认复用 |
 | Request/Ready 协商 | `RDMAClient::handle_download` | `request_piece` | 已对齐 |
-| post receive + receive-ready | `receive_stream` + `RecvPosted` | 原子保留完整 window；最多预投递 2 个；完整 post 后 `RecvPosted` | B2 完成，真机待验 |
-| operation completion 校验 | tag/chunk/length | lane/sequence/length + slot generation | B1/B2 完成，真机待验 |
+| post receive + receive-ready | `receive_stream` + `RecvPosted` | 原子保留完整 window；最多预投递 2 个；完整 post 后 `RecvPosted` | B2/B8 真机 PASS |
+| operation completion 校验 | tag/chunk/length | lane/transfer/SEND_IMM sequence/length + slot generation | B1/B2/B8 真机 PASS；反向 probe 待补 |
 | 内容向上交付 | `RDMAStreamReader`/`ReceivedWindow` | `UrmaStreamReader`/multi-span `UrmaReceivedWindow` | B3 完成 |
-| Storage 写入和 digest | registered window direct write/hash | immutable spans 上 positional write 与 CRC32 并行 | B3 完成，真机待验 |
-| stream drop/timeout/fallback | retire endpoint/session，TCP 重下 | Done gate、per-window/整 Piece timeout、owner recycle、partial reset | 已完成，真机待验 |
+| Storage 写入和 digest | registered window direct write/hash | immutable spans 上 receive-window `pwritev` 与 CRC32 并行 | B3 + pwritev 真机 PASS |
+| stream drop/timeout/fallback | retire endpoint/session，TCP 重下 | Done gate、per-window/整 Piece timeout、owner recycle、partial reset | 正常路径 PASS；完整 fault/shutdown matrix 待补 |
 
 Phase A 的两段式 RX staging 和 B2 过渡期的一次 aggregate copy 已从 production Piece 路径移除。
 B3 write/hash 共享 immutable lease，两个 blocking worker 都 join 后才显式 recycle；expected length、
@@ -114,11 +127,11 @@ dfdaemon UrmaServer task
 | metadata lookup | `Storage::get_*` | `UrmaServerHandler`，覆盖三类 Piece | 已完成 |
 | not-found/busy/internal reply | RDMA `abort(Error frame)` | typed handler/reply | 已完成 |
 | bandwidth limiter/metrics | 已有 | server adapter limiter/metrics | 已完成 |
-| Storage 数据源 | `open_piece_source`/`RangeReader`/optional mmap | `MappedPiece` 优先（配置开启）+ cache/mmap failure `RangeReader` fallback，直接填 TX lease | B4 完成，真机待验 |
-| receive-ready + SEND/completion | registered ring + per-op completion | `send_next_registered_window`；整窗 CQE state 持有 lease | B4 完成，真机待验 |
-| fill/SEND overlap | 两半 registered ring | 两个 exclusive lease；`send(current)` 与 `fill(next)` 并行，资源不足 ring=1 | B4 完成，真机待验 |
+| Storage 数据源 | `open_piece_source`/`RangeReader`/optional mmap | `MappedPiece` 优先（配置开启）+ cache/mmap failure `RangeReader` fallback，直接填 TX lease | B4 真机正常路径 PASS |
+| receive-ready + SEND/completion | registered ring + per-op completion | 并发 transfer 的 SEND_IMM window；整窗 CQE state 持有 lease | B4/B8 真机 PASS |
+| fill/SEND overlap | 两半 registered ring | 两个 exclusive lease；`send(current)` 与 `fill(next)` 并行，资源不足 ring=1 | ring1/ring2 与受控退化真机 PASS |
 | Piece Done | Done 后连接结束 | `finish_piece` 后 session 回 Idle | 已对齐；持久复用 |
-| server shutdown/drain | task shutdown + Fabric close | advertisement clear -> listener close -> lane/Fabric drain | 基础 wiring 完成，真机待验 |
+| server shutdown/drain | task shutdown + Fabric close | advertisement clear -> listener close -> lane/Fabric drain | 基础正常关闭 PASS；outstanding/fault 全矩阵待补 |
 
 B4 已移除 TX owned window、per-chunk `.to_vec()` 和 shim Segment copy。每个 negotiated message 独占
 一个 slot，即使 chunk 小于固定 slot 也可同时 outstanding；最后一个 CQE 前 lease 不会返回/refill。
@@ -172,6 +185,8 @@ B2/B3 又增加以下 RX contract：
 | TX direct-fill/双 ring/mmap（B4） | 代码和纯测试完成；production TX 1 次 source-fill copy | 真机 mmap/reader/tail/ring=1/2/CQE ownership |
 | post/CQ/credit batch（B5） | linked SEND/RECV、partial-post 前缀记账、CQ batch/fair owner 代码完成；单 lane postListSize=1/8 真机正常路径矩阵完成，结果见 B7 性能台账 | feature-on 编译记录；真实 provider partial post/CQ/error/flush 与多 peer 校准 |
 | budget/config/degradation（B6） | process byte ceiling、固定 TX/RX 分区、pipeline depth、optional second-window 退化和指标代码完成；inflight=16/32/64 单 lane真机矩阵完成 | feature-on 编译记录；真实 provider budget pressure、多 peer 进展与 shutdown 审计 |
+| 同 lane 并发与 native window（B8） | 并发 Piece、64-bit SEND_IMM route、aggregate JFR/JFS admission 和 native RX window concurrency 真机 PASS | 反向 probe、fault/shutdown 与更高吞吐 profile |
+| RX vectored write / 性能扩展 | receive-window `pwritev` 真机 PASS；单任务 63.51 Gbps；L8/CC8/TX128 均值 134.25 Gbps | allocator、owner/CQ、CRC/Storage 分层定位 |
 
 截至 B4 的已验证基线：
 

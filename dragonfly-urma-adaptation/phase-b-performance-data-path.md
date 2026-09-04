@@ -1,6 +1,20 @@
 # Phase B：URMA production 性能数据路径
 
-更新时间：2026-08-31。
+更新时间：2026-09-04。
+
+> 2026-09-04 状态覆盖：B1-B6 的 production data path 已由后续真实 provider 正常路径持续验证；
+> B8 已完成同一 persistent lane 的并发 Piece 生命周期、64-bit `SEND_IMM` identity 路由、native RX
+> window 并发，以及按 aggregate JFR/JFS depth 进行的 admission。接收端进一步改用 receive-window
+> `pwritev`，当前单任务峰值为 7570.72 MiB/s（63.51 Gbps）；8 lane、每 lane CC8、TX128 MiB 的
+> 两次纯 URMA 结果均值为 16003.86 MiB/s（134.25 Gbps）。当前性能工作已从“建立并发能力”转入
+> TX allocator、owner/CQ、CRC32/Storage 的分层定位。fault/shutdown 全矩阵、SEND_IMM 反向 probe
+> 和多物理 Child 拓扑仍是验证债务。本文中带 2026-08-31 或更早日期的状态段落保留为阶段性记录；
+> 最新数字和边界以 B7 性能台账为准。
+>
+> 2026-09-04 已实现 validation-only transport profile 和对应 B7 分层 case。profile 保留完整
+> control/lane/SEND_IMM/CQE/Done/lease lifecycle，只跳过 Child CRC32+pwrite；另一个严格同参数 case
+> 在 tmpfs 上保留正常 CRC32+pwrite。两者固定 L8×CC8、每轮 24 GiB，尚未执行真实 provider，因此
+> 此处只标记“代码/runner ready”，不记录性能结论。
 
 ## 0. 当前实施状态
 
@@ -439,7 +453,7 @@ Window A:                 refill A
 
 ### B1：registered window lease 基础
 
-`[状态：代码完成，真机待验]`
+`[状态：代码完成；正常/并发路径真机 PASS；active-close/outstanding fault 矩阵待补]`
 
 1. 将 registered backing 的生命周期与 slot allocator 状态解耦，提供只读 RX lease 和独占 TX lease。
 2. 明确 backing 是否可安全跨 owner/Tokio thread 读取；以 UMDK ABI/provider 要求验证 `Send/Sync`，
@@ -453,7 +467,7 @@ Window A:                 refill A
 
 ### B2：RX direct window 与双窗口预投递
 
-`[状态：lease/completion/pipeline 代码完成，真机待验]`
+`[状态：lease/completion/pipeline 代码完成；尾部、并发和预算退化真机 PASS；drop/fault 矩阵待补]`
 
 1. Fabric 支持把一个连续/逻辑连续 RX window 的多个 slot 作为一个 lease 发布。
 2. Session 将 `receive_next_window -> Vec<u8>` 改为 receive window reader/stream。
@@ -468,7 +482,7 @@ B2 消除了 RX slot -> `ReceivedChunk(Vec)` 和 chunk Vec -> aggregate window �
 
 ### B3：Storage direct-write 与 digest overlap
 
-`[状态：代码完成，纯测试/编译通过，真机待验]`
+`[状态：代码完成；direct-write、CRC32、pwritev 正常路径真机 PASS；pwrite fault/fallback 矩阵待补]`
 
 1. 增加 `download_piece_from_parent_finished_urma`，接口形态与 RDMA 专用 completion path 对齐。
 2. 每个 registered window 直接 positional write 到目标 Piece range，不经过 generic stream staging。
@@ -479,7 +493,7 @@ B2 消除了 RX slot -> `ReceivedChunk(Vec)` 和 chunk Vec -> aggregate window �
 
 ### B4：TX direct-fill、mmap 与双窗口 ring
 
-`[状态：代码完成，纯测试/编译通过，真机待验]`
+`[状态：代码完成；mmap direct-fill、ring=2 和受控 ring=1 退化真机 PASS；持久类/fault 矩阵待补]`
 
 1. server 从 BufferPool 获取 `TxWindowLease`，Storage source 直接填充 lease。
 2. 删除 production 数据路径上的 per-chunk `.to_vec()` 和普通 Vec -> registered slot write。
@@ -522,15 +536,30 @@ B2 消除了 RX slot -> `ReceivedChunk(Vec)` 和 chunk Vec -> aggregate window �
   `dragonfly_client_urma_budget_pressure_total{direction,stage}`（stage=`required|optional`）；peer/Piece、
   source-fill、Storage backpressure 使用结构化日志，避免高基数 metric labels。
 
-B6 的协议边界不包含“同一 lane 并发多个 Piece”：同一 parent 的 persistent Session 仍顺序传 Piece；不同
-peer 使用独立 lane。TX/RX shared overflow、动态 allocator 和更强跨 peer fairness 留待 B7 数据决定。
+B6 当时的协议边界不包含“同一 lane 并发多个 Piece”；该限制已由后续 B8 的 transfer multiplexing、
+`SEND_IMM` identity 和 native RX window concurrency 解除。TX/RX shared overflow、动态 allocator 和
+更强跨 peer fairness 仍由真实数据决定。
 
 ### B7：真实 provider 验证与性能验收
 
-2026-08-31 已完成固定 topology 的 1 GiB 单 lane 参数矩阵，当前有效最佳结果为
-`post8-in64 = 2410.47 MiB/s`；参见
+2026-08-31 完成的固定 topology 1 GiB 单 lane 参数矩阵中，当时最佳结果为
+`post8-in64 = 2410.47 MiB/s`；后续 B8、`pwritev` 和多 lane 结果已显著超过该值，参见
 [B7 真实 Provider 性能验证台账](./b7-real-provider-performance-ledger.md)。这只覆盖下列顺序中的
 连续正常路径和单流性能观测，不替代尚未执行的 fault、资源压力和多 peer 项。
+
+### B8：同 lane 并发 Piece 与 native window concurrency
+
+`[状态：核心数据路径和真实 provider 正常路径 PASS；完整 fault/shutdown 与反向 probe 待补]`
+
+- 同一 persistent lane 可同时承载多个 Piece transfer；control、Storage 准备和数据窗口不再全局串行；
+- `SEND_IMM` 携带 `(transfer_id, chunk_sequence)` identity，接收 CQE 可将 shared-JFR slot 精确路由回
+  transfer/window；目标 Dragonfly 方向的 64-bit identity、payload binding 和 drain 已通过真机验证；
+- JFR/JFS depth 已从单 Piece window depth 解耦，aggregate native permits 持有到对应 CQE 完成，避免
+  并发 transfer 把 provider queue 打满后返回 `ENOMEM`；
+- 同 lane native RX window concurrency、required-first TX/RX admission、受控 optional pipeline
+  退化及无 fallback 正常路径均已通过；稳定 C4 为 8335.11 MiB/s（69.92 Gbps）；
+- 接收端 `pwritev` 和后续多 lane 扩展属于 B8 后的性能优化：单任务 CC16 为 63.51 Gbps，L8/CC8
+  TX128 的两次均值为 134.25 Gbps。
 
 验证顺序：
 
@@ -571,8 +600,13 @@ Phase B 只有同时满足以下条件才完成：
 
 ## 8. 下一实施点
 
-B1-B6 已形成完整 RX/TX production copy-count、post batching 和固定注册预算/退化路径。下一轮进入 B7，
-在同一真实 provider 环境统一验证 B5/B6，并补齐 B1-B4 遗留的尾 window、连续 Piece、故障、budget
-pressure、公平进展和 outstanding shutdown 债务。当前机器无法完成的 feature-on 编译/测试也必须先在
-具备 `protoc`、Perl 和 UMDK build tree 的环境补跑；其中必须覆盖 Jetty/JFR 双 ERROR、send JFC
-flush-done、recv JFC drain 以及多 lane 共享 JFC 的顺序删除。静态检查不得当作真机 correctness 或性能结论。
+B1-B8 已形成 production copy-count、批处理、固定注册预算、同 lane 并发和 native window concurrency
+闭环。下一轮先使用当前已经落地的 `tx_required_pool_acquire_ns` / `tx_optional_pool_acquire_ns`，在
+L8/CC8/TX128 基线上量化 TX allocator；当前 allocator 会扫描并复制整个 TX slot state，并对每个选中
+slot 执行 `free_tx.retain()`，是唯一 owner thread 上的候选串行瓶颈。确认后再决定是否改为 O(window slots)
+的 scatter free-list allocation。transport-only 和 tmpfs CRC32+pwrite 的 L8×CC8/24 GiB B7 case 已
+落地，下一步按清理后交替 A/B 的顺序执行，再结合两端 CPU/NUMA 和 CQ/owner profile 区分
+completion、source-fill 与 Storage 上限。由于 RDMA PR #1945 的 concurrency 是单共享 RDM endpoint
+上的并发 Piece、不是 multi-lane，还需要补跑单 lane 多 Piece 作为结构对齐对照，不能只用 L8 总吞吐
+直接比较。fault/shutdown、反向 SEND_IMM probe、Jetty/JFR ERROR、
+flush-done/drain 和多物理 peer 验证继续并行补齐；静态检查不得当作真机 correctness 或性能结论。

@@ -14,6 +14,12 @@
 > A0～A4 状态已按当前源码更新；未完成部分主要是 client/server Storage adapter、dfdaemon
 > wiring 和真实 provider 验证。
 
+> 2026-09-04 状态覆盖：本文继续作为 Phase A 最小闭环的历史设计基线。A0-A4 已完成并被 Phase B/B8
+> production path 取代：当前 RX 为 registered window direct-write + CRC32，TX 为 mmap/RangeReader
+> direct-fill，同一 persistent lane 已支持并发 Piece 和 native RX window concurrency。本文第 3 节中
+> “不支持多 peer/并发 Piece”等条目描述的是 Phase A 范围，不是当前实现限制。最新 correctness、性能和
+> 未完成验证项以 Phase B 文档与 B7 性能台账为准。
+
 ## 1. 结论
 
 本阶段遵循 [架构决策：Dragonfly 长期骨架与 URMA demo 复用边界](./architecture-decision.md)。
@@ -508,10 +514,10 @@ storage:
       fabricTag: supernode-a
       maxRegisteredBytes: 40MiB
       txRegisteredBytes: 8MiB
-      maxInflightChunks: 64
+      maxInflightChunks: 512
       postListSize: 1
       pipelineDepth: 2
-      maxConcurrentTransfers: 16
+      maxConcurrentTransfers: 64
       transferTimeout: 30s
       mmapContent: false
 
