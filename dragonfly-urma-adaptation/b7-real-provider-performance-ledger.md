@@ -621,3 +621,110 @@ required wait/failure 的情况下仍下降，排除 registered budget 和 trans
 7.33/7.09/13.77 ms；CC32 的方向性证据与文件写竞争假设一致。但这些只是每组首条日志，不代表总体
 分位数。下一步应对 CC8/16/32 全部 Piece 的 `rx_window_wait_ns`、`digest_ns`、`pwrite_ns` 和
 `storage_total_ns` 汇总 p50/p95/p99，并结合 CPU/completion profiling 定位平台与回退来源。
+
+### 12.7 Provider `max_msg_size` 与可配置 chunk-size 议题
+
+`[设计议题登记，2026-09-03]` 当前 URMA process pool 在启动时注册一个连续 Segment，并固定按
+64 KiB slot 切分；一条 SEND_IMM 使用一个 slot，因此 provider 的 `max_msg_size` 即使大于 64 KiB，
+当前数据面仍只能发送至多 64 KiB。`postListSize` 增加的是一次提交的 WR 数，不改变单 WR payload。
+
+这里不能将 RDMA 的 `maxRegisteredBytes=512MiB` 解释成“预注册一个 512 MiB MR”。经
+`rdma-p2p-pr1945` 源码确认，RDMA 将该值作为 active + idle cache 的全局注册预算：pool 初始为空，
+`acquire_buffer(len)` best-fit 复用或按需注册可变长 `PinnedBuf`。默认 4 MiB chunk × 16 inflight
+形成 64 MiB window，发送端双 ring 最多可形成一个 128 MiB staging buffer；多个 MR 的总量才受
+512 MiB ceiling 约束。
+
+URMA 后续采用 hybrid 路线：对齐 RDMA 的显式 `chunkSize` 配置和两端/provider 协商，不照搬动态
+MR cache；保留 process 级连续预注册 Segment，将物理 slot size 改成 Runtime 级可配置值，同时用独立
+logical `windowSize` 控制每 transfer 的内存占用。第一轮真实 provider sweep 固定 window bytes，测试
+64 KiB/256 KiB/1 MiB/4 MiB chunk；继续记录 throughput、WR/CQE 数、TX/RX pressure、required wait、
+CPU 和 storage timing。该议题尚未实现，现有 64 KiB 测试数据和默认值保持有效。
+
+### 12.8 每 lane CC8 的多 lane fan-out 与 process admission 宽限
+
+2026-09-03 使用同一物理 Child host 上的隔离 daemon 运行 fan-out 饱和曲线。固定 1 GiB 文件、
+16 MiB Piece、每 lane CC8、post1、pipe2、in16；每组 1 次 warmup + 3 次 measured batch。该拓扑用于
+验证一个 Parent process 的多 lane 扩展，不代表多个物理 Child 节点。
+
+| run | lanes | aggregate MiB/s | Gbps | 相对前一点 | Jain | completion skew | 结果 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `fanout-piece16-cc8-l1-tx64-001` | 1 | **7212.60** | **60.50** | — | 1.00000 | 0 ms | PASS |
+| `fanout-piece16-cc8-l2-tx64-001` | 2 | **10737.82** | **90.08** | +48.88% | 0.99436 | 25.68 ms | PASS |
+| `fanout-piece16-cc8-l4-tx64-003` | 4 | **13648.16** | **114.49** | +27.10% | 0.99904 | 21.18 ms | PASS |
+
+L4 相对 L1 提升 89.23%，但 L2 到 L4 的边际收益已下降，开始接近共享 Fabric、completion、CPU 或
+Storage 路径的平台。L4 使用 MCT40、TX64 MiB + RX32 MiB；TX required pressure 为 0，optional
+pressure 为 334，只有 2 次 single-ring 退化，且无 BUSY/reject、session retirement、TCP fallback 或
+previous-transfer failure。
+
+L4 在修复前使用瞬时 `try_acquire` 判断 process transfer admission，即使每个 Child 的最大活跃 Piece
+均为 8，Parent 仍会在 persistent-lane Piece 收尾交接期间成批返回 BUSY。修复后保留 MCT 硬上限，满载
+时先有界等待 10 ms，超时才返回 transfer-local BUSY。本次共 1024 个含 warmup transfer，其中 82 次
+等待后成功（8.01%）；mean/p50/p95/p99/max 分别为 1.615/1.318/3.981/4.574/4.574 ms，最大值仅占
+10 ms 门限的 45.74%。这证明问题是可被短宽限吸收的服务端 permit 释放交接，不是持续过载或 permit
+泄漏。
+
+L8 首轮 `fanout-piece16-cc8-l8-tx128-001` 进一步暴露 permit 释放位置仍晚于数据面完成：330 个 Piece
+虽在 10 ms 宽限内取得 admission，但 p95/p99/max 已达 9.313/10.322/10.908 ms，另有 21 个 Piece
+超时收到 BUSY 并 fallback TCP。该轮 aggregate 为 12731.73 MiB/s（106.80 Gbps），但包含 fallback，
+不得作为纯 URMA 基线。服务端随后将 process permit 改为在全部 SEND WR 完成且 TX leases 回收后、发送
+`Piece Done` 前释放；错误、超时和取消路径仍由 RAII guard 释放。该顺序保证释放时数据面资源已归还，
+同时让 Client 在收到 terminal frame 并启动替代 Piece 前即可观察到空闲 permit。
+
+修复后的 L8/TX128 与 TX budget 对照如下。固定 8 lanes、每 lane CC8、MCT80、16 MiB Piece、post1、
+pipe2、in16、RX32 MiB；每个 run 为 1 次 warmup + 3 个 measured batch。所有列出的 run 均为纯 URMA
+PASS，process admission wait、BUSY/reject、session retirement、TCP fallback 和 previous-transfer failure
+均为 0。
+
+| run | TX / 总注册预算 | aggregate MiB/s | Gbps | Jain | completion skew | TX optional pressure | TX ring1 fallback |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `fanout-piece16-cc8-l8-tx128-002` | 128 / 160 MiB | **16053.62** | **134.67** | 0.99900 | 40.91 ms | 1564 | 122 |
+| `fanout-piece16-cc8-l8-tx128-005` | 128 / 160 MiB | **15954.09** | **133.83** | 0.99951 | 30.33 ms | 1429 | 148 |
+| `fanout-piece16-cc8-l8-tx160-001` | 160 / 192 MiB | **11667.94** | **97.88** | 0.99926 | 50.86 ms | 1670 | 156 |
+| `fanout-piece16-cc8-l8-tx160-003` | 160 / 192 MiB | **13479.93** | **113.08** | 0.99911 | 38.28 ms | 1747 | 137 |
+
+两次 TX128 的均值为 16003.86 MiB/s（134.25 Gbps），两次只相差 0.62%；相对 L4 提升 17.26%。
+TX160 均值为 12573.93 MiB/s（105.48 Gbps），比 TX128 均值低 21.43%，且 TX160 两次相差
+15.53%。增加预算没有降低 optional pressure，ring1 次数也未与吞吐同向变化，因此 TX budget 和双 ring
+可用率不是该点的主吞吐瓶颈；当前推荐保留 TX128。
+
+这里一个满载 transfer 的双 ring 工作集为 `2 * 16 * 64 KiB = 2 MiB`，8 lanes * CC8 共 64 个
+活跃 transfer，理论总量正好为 128 MiB。`optional pressure` 还包括 optional lease 主动让位给 required
+waiter，不能等同于物理 pool 耗尽；上述 run 的 `txBufferUnavailableLines` 均为 0。代码审查同时发现
+当前 TX window allocator 每次申请会扫描整个 TX slot 区、复制全部 slot state，并对每个选中 slot 执行
+`free_tx.retain()`；TX slots 从 2048 增至 2560 会放大串行 allocator bookkeeping。该路径是下一轮应先
+计时验证的候选瓶颈，尚不能只凭本组 E2E 数据认定为唯一根因。
+
+测试卫生方面，连续未 cleanup 的 run 曾出现吞吐逐轮下降，执行清理后 TX128 恢复至 15954.09 MiB/s。
+runner 的 origin artifact 是公共 seed 的 hard link，不能仅凭删除 `/var/www/dragonfly` 链接就认定释放了
+对应文件数据或 page cache；未清理的 `/var/lib/dragonfly-b7/<run>`、主机负载和冷热缓存均可能参与。
+后续正式对照必须在每轮保存本地 evidence 后执行 manifest-owned `cleanup --execute`，并交替运行 A/B；
+本台账不把未严格控制的连续下降归因于单一目录。
+
+### 12.9 每 lane CC1 的 lane 扩展曲线
+
+同日补录第一组 fan-out 数据。固定 1 GiB 文件、16 MiB Piece、每 lane CC1、post1、pipe2、in16、
+MCT8、TX16 MiB + RX32 MiB；每组 1 次 warmup + 3 次 measured batch。L1 使用普通 queue topology，
+L2/L4/L8 使用同一物理 Child host 上的隔离 daemon，因此该组证明的是一个 Parent process 面向多个
+lane/daemon 的扩展，不代表多物理节点。
+
+| run | lanes | aggregate MiB/s | Gbps | 相对前一点 | Jain | completion skew | manifest 状态 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `fanout-piece16-cc1-l1-001` | 1 | **2080.34** | **17.45** | — | 1.00000 | 0 ms | passed |
+| `fanout-piece16-cc1-l2-001` | 2 | **2806.45** | **23.54** | +34.90% | 0.97132 | 212.80 ms | cleaned（结果保留） |
+| `fanout-piece16-cc1-l4-001` | 4 | **4405.17** | **36.95** | +56.97% | 0.99934 | 56.21 ms | passed |
+| `fanout-piece16-cc1-l8-001` | 8 | **6417.47** | **53.83** | +45.68% | 0.99998 | 17.68 ms | passed |
+
+L8 相对 L1 达到 3.08 倍（+208.48%），说明在每 lane 只有一个 Piece 时，增加 lane 能持续填充共享
+URMA Fabric；但扩展不是线性的，8 倍 lane 只得到约 3.08 倍吞吐。L2 的 Jain 和 completion skew 明显
+弱于其余点，属于该组的离群稳定性信号，后续若用于客户材料应至少复跑一次 L2。
+
+该组还可与 12.8 的 L1/CC8 做一个“总 Piece concurrency 均为 8”的方向性对照：L8/CC1 为
+6417.47 MiB/s，L1/CC8 为 7212.60 MiB/s，前者低 11.02%。两组的 lane/daemon 数和 TX budget 不同，
+不是严格 A/B；但结果支持当前判断：在总 Piece concurrency 已足够时，优先在持久单 lane 内复用并发
+Piece，比单纯增加 lane 更高效；多 lane 的主要价值是跨独立 peer/daemon 扩展总并发和总吞吐。
+
+本次命令对 L2/L4/L8 查询了 `.result.urmaDiagnostics`，而 fan-out diagnostics 实际位于
+`.result.fanoutDiagnostics`，所以输出中的 `null` 不表示相关计数为零。L2 当前 manifest 已进入
+`cleaned` 生命周期状态。表中保留其 transfer summary，但在未补取/确认 `fanoutValidation` 和
+`fanoutDiagnostics` 前，不额外宣称该点具有零 fallback/零 retirement 证据。

@@ -299,6 +299,42 @@ demo 的真实 provider 结果证明了这些机制组合有价值，但不能�
 | 回收 | 最后一个 operation/reader owner 释放后直接返回本地 pool | consumer 通过 urgent owner command 校验 lease/generation 后回收 |
 | 资源不足 | 等待预算或 non-blocking 失败 | `BufferUnavailable`；第二 window 安全退化为 pipeline depth 1 |
 
+#### 3.1.1 RDMA `maxRegisteredBytes` 语义澄清与 URMA chunk-size 适配
+
+`[源码确认，2026-09-03]` RDMA 的默认 `maxRegisteredBytes=512MiB` 是 active + idle cached
+registered buffer 的**总预算**，不是启动时分配并注册一个连续 512 MiB MR。RDMA `BufferPool` 初始为空；
+`acquire_buffer(len)` 优先 best-fit 复用容量足够的 idle `PinnedBuf`，cache miss 时才按请求的可变长度
+分配并调用 `fi_mr_reg`。buffer 归还后继续保留注册并进入 cache，所有 active/cached buffer 通过按
+64 KiB 粒度计数的 semaphore 共同受 512 MiB 上限约束。
+
+RDMA 默认 `chunkSize=4MiB`、`maxInflightChunks=16`，所以一个 logical receive window 通常为
+64 MiB。接收端可在预算允许时同时持有两个独立 window buffer；发送端可申请一个覆盖双窗口的
+128 MiB staging buffer。运行后可能存在多个不同 capacity 的 cached MR，其总量接近 512 MiB，
+但不等价于一个 512 MiB contiguous MR。
+
+当前 URMA 则确实在 Runtime 启动时注册一个 `maxRegisteredBytes` 大小的连续 Segment，再按固定
+64 KiB slot 切分。其有效单条 SEND/SEND_IMM payload 是 provider `max_msg_size` 与 slot size 的较小值；
+因此 provider 支持大于 64 KiB 的消息时，当前实现仍无法利用该能力。`postListSize` 只批量提交多个
+64 KiB WR，不会增大单条消息。
+
+后续适配采用以下边界：
+
+1. 配置和 capability negotiation 对齐 RDMA，引入显式 `chunkSize`，取本地配置、两端 provider
+   `max_msg_size` 和 peer capability 的最小值；默认先保留 64 KiB 以维持兼容性。
+2. 不直接迁移 RDMA 的 per-window variable-length registration/cache；URMA 第一阶段继续使用 process
+   级连续预注册 Segment，并将 slot size 改为 Runtime 启动时确定的统一 `chunkSize`。
+3. window 容量应与 chunk size 解耦，优先按 `windowSize` 字节数表达，再推导
+   `chunksPerWindow = windowSize / negotiatedChunkSize`，避免增大 chunk 时按
+   `chunkSize * maxInflightChunks * pipelineDepth * maxConcurrentTransfers * laneCount` 放大注册内存。
+4. 第一阶段只支持一个 Runtime/Segment 对应一种物理 slot size；协商得到更小 chunk 时使用 slot 前缀，
+   接受一定内部碎片。只有真实 workload 证明 size 分布离散且浪费显著时，再评估 size class 或动态 arena。
+5. SEND_IMM identity、slot generation、lane/transfer completion route、lease recycle 和 shutdown/drain
+   语义保持不变；chunk-size 改造不能弱化这些已验证的所有权边界。
+
+验证时先固定 logical window bytes，比较 64 KiB、256 KiB、1 MiB 和 4 MiB chunk，以隔离单 WR 大小
+带来的 posting/CQE 收益；另设一组 RDMA 默认形态（4 MiB × 16 = 64 MiB window）用于机制对齐，不能
+与固定小 window 的结果混为同一变量实验。
+
 URMA 已在 B6 补齐、不要求照搬 RDMA 类型的能力：
 
 - `maxRegisteredBytes` 约束 process 级预注册 Segment 总量，active + idle/预留内存都计入；
