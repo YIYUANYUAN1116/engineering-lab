@@ -1,12 +1,12 @@
 # Dragonfly × URMA RM 研究阶段总结
 
-更新时间：2026-09-05
+更新时间：2026-09-06
 
 > 研究目标：评估 URMA Reliable Message（RM）是否比当前 URMA RC persistent-lane 模型更适合 Dragonfly P2P。
 >
 > 当前状态：服务器环境已被重置，暂无可用 URMA 真机环境；本阶段以 UMDK/liburma 源码、官方 API/示例、现有 Dragonfly URMA RC 实现与既有实验结果为依据，不将未验证内容写成 provider 实验事实。
 >
-> 原型状态：`urma-rm-prototype` 是 RM-only 实验分支，已完成 DFUR v3 显式 RM 标识、provider RM capability gate、RM import-only、独立 `TargetHandle`（native 边界已允许一个 Jetty 拥有多个 imported target）、`PeerTargetRegistry` 的 full-identity/generation/Active/Draining 生命周期、完整 completion `remote_id` DTO 透传，以及 receive CQE 在消费 WR ownership 前对授权 target 的 fail-closed 校验；配置与 wire decoder 均拒绝 RC，RC 基线由原分支/提交保留。高层 Runtime 仍暂时是一 Lane/一 Target，尚未把本地 Jetty/JFR 提升成单一共享对象。静态检查与纯软件测试已通过，但尚未经过真实 RM provider 数据面验证，因此不能据此宣称 RM 可用或性能成立。
+> 原型状态：`urma-rm-prototype` 是 RM-only 实验分支，已完成 DFUR v3 显式 RM 标识、provider RM capability gate、RM import-only、独立 `TargetHandle`、process-wide shared RM Jetty/JFR、完整 completion `remote_id` DTO、anonymous shared RX，以及 receive CQE 在消费 WR ownership 前通过 `PeerTargetRegistry -> TransferRegistry` 对授权 source/routing token 的 fail-closed 校验；配置与 wire decoder 均拒绝 RC，RC 基线由原分支/提交保留。process-wide RX/TX admission 和纯逻辑 `PeerCredit` guaranteed/borrowed 账本已落地，但静态 per-peer quota policy 尚未接入异步数据路径。静态检查与纯软件状态机测试已通过，但尚未经过真实 RM provider 数据面验证，因此不能据此宣称 RM 可用或性能成立。
 >
 > 核心关注点不是“RM 是否比 RC 更快”，而是：
 >
@@ -1427,22 +1427,91 @@ urma-rm-prototype
    - receive CQE 在 `take_outstanding()`、`wr_complete()` 和 buffer ownership 变化之前，先用硬件 `remote_id` 解析已授权 PeerTarget，再交叉校验 token 中的 PeerTarget ID/generation。
 
 6. **RM2 shared endpoint 收敛（2026-09-04 第二轮）**
-   - Runtime 新增唯一 `SharedRmEndpoint { UrmaJetty, descriptor, config, effective_post_list_size }`：第一个 Peer `create_lane` 时惰性创建并注册到 completion 路由，后续 Peer 复用同一 local descriptor；per-peer Jetty 配置与共享端点不一致直接报错（RM-only，不做隐式第二个端点）；
+   - Runtime 新增唯一 `SharedRmEndpoint { UrmaJetty, descriptor }`：第一个 Peer `create_lane` 时惰性创建并注册到 completion 路由，后续 Peer 复用同一 local descriptor；endpoint native depth 由 Runtime 的 JFC depth、provider capability 和 process-wide TX/RX 注册 slot 数统一推导，不再接受 per-peer Jetty sizing；
    - `UrmaJetty` 变为无内部 target 的共享 Jetty：`import_target` 返回独立 `TargetHandle` 交由 Peer 持有，`post_send_imm/post_send_batch` 显式携带 target；`export_descriptor` 在端点创建时导出一次；
    - `UrmaLane` 剥离 native Jetty，仅持有 `TargetHandle` + credits + 生命周期状态（`Created -> Ready -> Draining -> Closed`）；`connect_remote_descriptor/mark_ready/export_descriptor` 收敛为单一 `import_remote(jetty, descriptor)`，导入后即 Ready；
    - completion 路由收敛：`register_lane/lane_by_jetty_id/per-lane flush` 全部替换为 `register_endpoint` + 端点级 `EndpointLifecycle`；CQE 的 `local_id` 必须等于唯一共享端点 jetty id，否则 fail-closed（不触碰 WR ownership）；
    - RECV source 路由改为 `resolve_source(remote_id)`：从硬件上报远端身份经 `PeerTargetRegistry` 解析来源 Peer，`RegisteredRxCompletion.lane_id` 使用 source Peer，slot 归属仍跟随 posting WR token；
    - retirement 语义拆分：per-peer abort 仅 drain 该 PeerTarget（不再对共享 Jetty `mark_error`，避免拖垮其他 Peer）；仅 Runtime shutdown 超时才升级为端点级 flush（`begin_endpoint_flush` + Jetty `mark_error`，等待 `WR_FLUSH_ERR_DONE`），随后关闭共享 Jetty；
-   - 测试同步改写：flush gate 收敛为端点级、跨 native jetty fail-closed、source 授权 fail-closed 等 6 个路由测试；新增端点配置一致性约束（同进程所有 Peer 共用一份 `UrmaLaneConfig`，client/server 均从同一全局 config 派生，已核实不冲突）。
+   - 测试同步改写：flush gate 收敛为端点级、跨 native jetty fail-closed、source 授权 fail-closed 等路由测试；Peer 配置只保留 post-list/pipeline 策略，不能改变 shared endpoint native sizing。
 
 7. **RM2 shared RX 与故障域修正（2026-09-05 review 修复）**
-   - RX `WrToken` 改为 endpoint 级 anonymous token：`owner/lane_id=0` 只标识物理 slot、slot generation 和 RECV operation；逻辑 waiter 继续按 `(PeerTargetId, routing_token)` 独立登记，CQE 到达后再由 `remote_id + routing_token` 解析消费者；
+   - RX `WrToken` 改为 endpoint 级 anonymous token：`owner/peer_id=0` 只标识物理 slot、slot generation 和 RECV operation；逻辑 waiter 继续按 `(PeerTargetId, routing_token)` 独立登记，CQE 到达后再由 `remote_id + routing_token` 解析消费者；
    - 物理 RECV WR 不再计入某个 PeerTarget 的 outstanding。PeerTarget 退役会取消其逻辑 RX waiter，但匿名 RQE 保留在 shared JFR 中供其他 Peer 消费，避免空闲 shared RQE 导致 target 永久无法 unimport；
    - 增加 shared JFR endpoint 级 depth admission，所有 Peer 合计的 posted RECV 不得超过唯一 JFR 的 `recv_depth`；现阶段仍保留 per-session semaphore 作为逻辑流水线限制，尚未实现 guaranteed quota / borrowable surplus / emergency headroom；
    - 可可靠归属到 PeerTarget 的 WR error completion 改为排队触发该 PeerTarget drain，不再直接 poison 整个 shared Fabric；无法可靠取得 source/routing identity 的错误仍升级为 Fabric 级 fail-closed；
    - `PeerTargetRegistry` 允许同一 process-wide `remote_id` 对应多个 control-session alias，并使用已注册 routing token 消歧；Client transfer id 改为进程级分配，避免不同 session 从 1 开始造成 SEND_IMM identity 冲突；
    - Runtime shutdown gate 同时检查逻辑 lane 与 endpoint 全局 outstanding。即使所有 lane 已先退役，只要 anonymous RQE 尚未完成，也必须执行 endpoint ERROR/flush 并等待 `WR_FLUSH_ERR_DONE` 后才能删除 Jetty；
    - 新增 anonymous RX ownership、shared JFR capacity、PeerTarget retirement、remote identity alias 和 Peer-local completion error 的离线单测。2026-09-05 本机因缺少 `protoc` 未执行测试；`cargo fmt --check` 与 `git diff --check` 通过。
+
+8. **Per-peer TransferRegistry 与 routing identity 收敛（2026-09-05）**
+   - 新增独立 `RoutingToken`，集中定义 64-bit SEND_IMM 的 `u32 transfer_id + u32 chunk` 编解码和非零/越界校验；
+   - 删除 CompletionRouter 的扁平 `registered_rx_by_identity: HashMap<(PeerTargetId, token), waiter>`，逻辑 RX waiter 下沉为 `PeerTargetRegistry[PeerTargetId].TransferRegistry[transfer_id][chunk]`；
+   - `remote_id` 先解析授权 PeerTarget alias，再在该 Peer 的 TransferRegistry 中匹配 routing token；相同 token 可存在于不同 PeerTarget，只有同一 remote identity alias 下无法唯一匹配时才 fail-closed；
+   - PeerTarget 进入 Draining 时只 drain 自己的 TransferRegistry；移除 target 前强制 registry 为空，fabric fatal 则 drain 全部 Peer 的逻辑 waiter；
+   - transfer id 使用 process-wide allocator，进程生命周期内不再 wrap/reuse；`u32` 空间耗尽时 fail-closed。该方案以“不复用完整 transfer identity”替代额外压缩 generation 位，继续保留完整 32-bit chunk 空间；
+   - 新增 routing token、per-peer registry isolation/drain 和 transfer-id exhaustion 离线单测。macOS 本机不能构建 `feature=urma`，因此本轮仅完成 `cargo +stable fmt --all`、`git diff --check` 和 feature-off storage 104/104 回归；URMA feature 测试仍待 Linux/UMDK 环境执行。
+
+9. **Process-wide shared RX admission（2026-09-05）**
+   - 将原先每个 `ClientLane` 独立创建的 `recv_depth` semaphore 收敛为 `FabricInner` 唯一的 shared RX admission semaphore；所有下载 PeerTarget 竞争同一份 shared JFR/RX arena 容量；
+   - admission depth 使用 Fabric 的 process-wide native depth；所有 Peer 取得同一 semaphore，若内部调用传入不同 depth 则 fail-closed；
+   - required first window 使用 Tokio semaphore 的排队获取，optional second window 只尝试借用当下 surplus，并继续在 process-wide required waiter 存在时主动让行；热点 Peer 可以借空闲容量，但不能再通过 per-lane semaphore 将 process-wide logical admission 放大为 `peer_count × recv_depth`；
+   - shared RX permit 从 post 前一直持有到合并后的 immutable registered RX lease 被 Storage 释放，覆盖 `Posted/In-flight -> CQE routing -> Leased/CRC/pwrite -> recycle`，避免 CQE 一到就过早归还逻辑容量；
+   - 新增 shared semaphore identity/depth、容量归还和 RX lease 同时持有 pipeline/shared credit 的离线单测。本机验证边界与第 8 项相同。
+
+10. **Shared RX 守恒快照与异常分类（2026-09-05）**
+   - `UrmaBufferPool` 从真实 slot state 生成 endpoint 级 RX 快照：`F=Free`、`A=Allocated`、`P=PostedRecv`、`R=RecvCompleted`、`L=LeasedRx`，并校验 `F+A+P+R+L=RX total`；`A/R` 是 owner-thread 内的短暂过渡态，稳定边界通常只保留 `F/P/L`；
+   - CompletionRouter 同时暴露实际 outstanding RECV WR 数和已授予的 logical routing-token 数；Runtime 在 receive post、CQ poll/reap、RX lease recycle 等稳定边界校验 `physical P == tracked posted WR` 且 `logical credits <= posted WR`；
+   - 新增低基数 Prometheus 状态指标 `urma_rx_state{state=free|allocated|posted|ready|leased|logical_credits}`，守恒校验通过后由唯一 owner thread 发布；
+   - receive routing failure 改为 typed classification，并新增 `urma_rx_anomaly_total{reason=missing_source|unknown_source|invalid_token|stale_token|over_credit|ambiguous_token}`；同一 active transfer 下未授予的 chunk 计为 over-credit，不存在 active transfer 的 token 计为 stale；unknown/stale/over-credit 仍 fail-closed，不因为“有计数”就视为可安全继续消费异常 CQE；
+   - 本轮使用本机现有 stable Rust 验证：`dragonfly-client-metric` 21/21 通过，storage feature-off 104/104 通过，`cargo +stable fmt --all` 与 `git diff --check` 通过。macOS 仍无法构建 Linux-only `feature=urma`，新增 URMA 状态机测试待 Linux/UMDK 环境执行。
+
+11. **Required/optional admission 竞态收敛（2026-09-05）**
+   - 修复 required waiter 可见区间过晚的问题：此前 first window 只有取得 shared semaphore 后、进入 Fabric post retry 时才登记 required waiter，因而它在等待 native capacity 期间对 optional borrower 不可见；现在从等待 shared semaphore 之前开始登记，直到 native post 完成或失败才释放；
+   - optional native admission 收敛为 Fabric helper，在非阻塞 acquire 前后两次检查 process-wide required waiter；若检查窗口中出现 required waiter，立即归还刚借到的 surplus。后续 Fabric command admission 仍保留第二道 required-waiter gate；
+   - 这保证 optional second window 在 semaphore 与 buffer/command 两阶段都主动让行，但仍属于 work-conserving fairness，不等价于为每个 idle Peer 静态切出物理 RQE；
+   - 新增 optional borrow 在 capacity pressure 和 required waiter 存在时均拒绝、waiter 退出后恢复借用的离线单测。验证边界仍为 macOS feature-off 回归，真机/`feature=urma` 待 Linux 环境。
+
+12. **删除 RC 式 per-lane native sizing/admission（2026-09-06）**
+   - 当前名为 `PeerTargetConfig` 的内部配置已删除 transport mode、send/recv depth、SGE 和 import token，只保留 Peer-local 的 post-list 与 pipeline 策略；Rust FFI 和 C shim 的 Jetty config 也删除 transport mode 字段，JFS/JFR 创建及远端 descriptor 校验直接固定使用 `URMA_TM_RM`，不再把 transport mode 表现成内部可选项。provider capability 与 DFUR v3 capability 仍显式携带 RM 值，用于 fail-closed 拒绝不支持 RM 的设备或非 RM 对端；
+   - `SharedRmEndpoint` 的 JFS/JFR depth 改为 Runtime 统一计算：分别取 JFC depth、provider max depth、process-wide registered TX/RX slot 数的最小值；第一个 Peer 不再决定唯一 endpoint 的 native sizing，client/server 的方向性窗口策略也不再要求伪造相同的 per-lane Jetty config；
+   - server 原先为每个 Peer 创建的 `native_send_permits` 改为 Fabric process-wide shared TX semaphore，避免多 Peer 将唯一 shared JFS 的 logical capacity 放大为 `peer_count × send_depth`；RX 已使用同构的 process-wide semaphore；
+   - client/server 的 `ReceiveDepths/SendDepths` 删除 `lane_depth`，只计算 Piece/window policy；per-Piece inflight 上限直接与 Fabric shared native depth 校验；
+   - wire capability、PeerTarget 身份和逻辑 lifecycle 继续保留，它们是 RM 控制面语义，不是 RC native-resource 兼容层。
+
+13. **建立 per-peer RM credit 纯逻辑账本（2026-09-06）**
+   - 新增与 native WR ownership 解耦的 `PeerCreditRegistry`，按 PeerTarget 分别记录 `guaranteed_limit`、正在使用的 guaranteed credit、borrowed credit 和 outstanding；anonymous shared-JFR RQE 仍不预先绑定 Peer；
+   - grant 优先消费本 Peer 未使用的 guarantee；borrowed 部分只能使用扣除所有 Peer 当前未使用 guarantee 后的 process-wide surplus，zero-guarantee Peer 可使用真实 surplus，但不能侵占已注册 guarantee；
+   - 动态注册 Peer 时同时校验当前 outstanding borrowed credit，保证 `outstanding + unused guarantees <= shared capacity` 始终成立，避免已有热点借用把后来注册的 guarantee 变成不可兑现承诺；
+   - grant 凭证不可复制且由 release 消费，Peer 注销前必须没有 outstanding credit；加入 guarantee 保护、surplus 借用、动态注册防超额承诺、zero-guarantee Peer 和 drain 前置条件测试；
+   - 本项先完成可单测的策略状态机；其后的生产接入、默认 quota 和 async semaphore 联动见第 16 项。未授予且未 prepost 的容量仍不称为 emergency headroom。
+
+14. **收口 PeerTarget generation、Draining 与 endpoint shutdown gate（2026-09-06）**
+   - `PeerTargetRegistry` 新增 active-generation gate：TX 在触碰 native slot 前和登记 completion ownership 时分别校验 PeerTarget 存在、generation 匹配且仍为 Active；stale generation 和已进入 Draining 的 Peer 均不能产生新 outstanding；
+   - PeerTarget 进入 Draining 时清空尚未消费的 remote receive credit，后续 credit grant、RX post 和 SEND 均由 Ready/Active gate 拒绝；已有 SEND 仍必须等待 CQE 收敛后才能 unimport；
+   - 增加双 Peer 故障域测试：Peer A 的可归属 SEND completion error 只将 A 加入 failed-peer retirement 队列，A 停止新 admission，而 Peer B 的既有 SEND 仍可在同一 shared endpoint 上成功完成并继续接受新工作；
+   - 增加 late-CQE generation 测试：旧 generation 的 `user_ctx` 即使复用同一 Peer id/slot，也不能消费当前 generation 的 outstanding ownership；当前 CQE 随后仍可正常完成；
+   - 增加 shutdown 组合测试：Peer 已注销后 anonymous shared-JFR RQE 仍属于 endpoint；只有 outstanding RQE 已收到 error CQE 且 send JFC 已收到 `WR_FLUSH_ERR_DONE` 两个条件同时成立，endpoint 才可关闭；
+   - 这些是纯软件 fault-domain/lifecycle 证明。provider 缺少 per-target flush/error-query 接口时，单 Peer 对端挂死且不产生 CQE 仍不能独立强制收敛，只能在 Runtime shutdown 超时后升级为 endpoint `mark_error`；仍须 RM0 真机验证其实际 blast radius。
+
+15. **删除 native owner 层的 RC Lane 命名（2026-09-06）**
+   - native `UrmaLane` 改名为 `PeerTarget`，`LaneState` 改为 `PeerTargetLifecycle`，本地 credit 改为 `PeerSendCredits`；对象含义明确为“shared RM endpoint 上一个 imported remote target”，不再暗示每 Peer 拥有 Jetty/JFR；
+   - `UrmaRuntime` 的 `HashMap<lane_id, UrmaLane>` 改为 `HashMap<peer_id, PeerTarget>`，创建、连接、abort、reap、close、id allocator 和 shutdown 日志全部使用 PeerTarget 语义；
+   - completion 的 SEND ownership 字段改为 `peer_id`，计数和 retirement API 改为 `outstanding_by_peer`、`begin_peer_retirement`、`unregister_peer`；`WrToken` 位布局不变，仅把高 16 位的代码语义从 `lane_id` 更正为 `peer_id`；
+   - 内部 batching/pipeline 配置改名为 `PeerTargetConfig`。现有 TCP `LaneConnect/LaneConnected` wire DTO、session facade 及其日志仍暂时保留 lane 名称，本轮不修改协议编码或上层调用边界；后续可独立做 facade 命名迁移。
+
+16. **将 per-peer guaranteed/borrowed RX credit 接入生产数据路径（2026-09-06）**
+   - `PeerCreditRegistry` 不再是 `cfg(test)` 状态机；新增 process-wide `PeerCreditAdmission`，由一份 Tokio semaphore 表示 shared JFR/RX arena 物理容量，由账本保护每个 active download PeerTarget 的未使用 guarantee；required acquire 使用 FIFO async gate，optional second window 仍在全局 required waiter 存在时让行；
+   - 新增 `storage.server.urma.peerGuaranteedRxCredits`，默认 `0`，因此不改变现有 work-conserving 行为。非零值表示每个 active download PeerTarget 的静态保证额度；注册时若 `sum(guarantee)` 超过 shared depth，或当前 borrowed outstanding 使新保证暂时无法兑现，则该 Peer 建立失败并走现有上层 fallback，而不是超额承诺；
+   - RX credit permit 继续由 `RegisteredRxWindowLease` 持有，直到 Storage 完成消费并 recycle lease 才同时归还物理 permit 和 guaranteed/borrowed 账目；required acquire 被 timeout/cancel 时 RAII 自动归还已预留的逻辑 credit；
+   - PeerTarget 开始退役后立即拒绝新 credit；若仍有 lease-held credit，则账户延迟注销到最后一个 permit 释放，避免重连/ID 复用覆盖旧 generation 的账目。握手、control task 建立和 transfer abort 的失败路径均显式触发 credit retirement；
+   - 本机现有 stable Rust 验证：独立 credit harness 8/8、配置 43/43、storage feature-off 104/104 通过。macOS 不能构建 Linux-only `feature=urma`，因此 session/fabric/buffer 的完整类型检查、URMA feature 单测和真实 provider 行为仍待 Linux/UMDK 环境。
+
+17. **补齐 per-peer RX credit 低基数可观测性（2026-09-06）**
+   - 新增 `urma_rx_peer_credit{state=active_peers|retiring_peers|guaranteed_limit|guaranteed|borrowed|outstanding}`，发布 process-wide 聚合快照，不携带 PeerTarget ID、remote identity 或 transfer ID；
+   - 新增 `urma_rx_peer_credit_event_total{event=registered|register_rejected_capacity|register_rejected_duplicate|register_rejected_configuration|retiring|unregistered}`，可以区分配额容量拒绝和生命周期变化，同时保持 label 词表固定；
+   - account register、grant、permit release、retire 和 deferred unregister 都更新同一聚合快照；重复 retirement 不重复计数。新增“热点 Peer 借满容量导致新 guarantee 被拒绝，借用释放后可干净重试”的离线测试；
+   - 本轮本机 stable Rust 验证：metric 22/22，独立 credit harness 9/9；完整 URMA feature 仍遵循第 16 项的 Linux/UMDK 验证边界。
 
 本阶段验证结果（截至第二轮 shared endpoint 收敛后）：
 
@@ -1464,15 +1533,15 @@ shared endpoint 落地后（§21.1 第 6 项），Runtime 结构已收敛为：
 ```text
 Runtime
   -> SharedRmEndpoint（唯一 Jetty/JFR/descriptor/config）
-  -> HashMap<lane_id, UrmaLane>   // 仅 TargetHandle + credits + 状态
+  -> HashMap<peer_id, PeerTarget> // 仅 TargetHandle + credits + 状态
   -> CompletionRouter（端点级路由 + PeerTargetRegistry source 解析）
 ```
 
 尚未完成：
 
-- RX WR 已改为 anonymous token，完成时使用 `remote_id + routing_token` 解析逻辑 owner；`registered_rx_by_identity` 仍是扁平 `(PeerTargetId, routing_token)` 表，尚未下沉为 `PeerTarget -> per-peer TransferRegistry`；
-- routing token 当前编码 process-wide `transfer_id + chunk sequence`，解决并发 session 的直接冲突；仍未编码 transfer generation，极端 ID wrap/reuse 命中旧 CQE 的风险尚未闭环；
-- 已有 endpoint 级 posted-RX/JFR depth 硬门禁，但尚无 per-peer guaranteed quota、borrowable surplus、over-credit accounting 或 emergency headroom；
+- RX WR 已改为 anonymous token，完成时使用 `remote_id + routing_token` 解析逻辑 owner；逻辑 waiter 已下沉为 `PeerTarget -> per-peer TransferRegistry -> chunk`；
+- routing token 编码 process-wide `u32 transfer_id + u32 chunk`；transfer id 在进程生命周期内不复用并在空间耗尽时 fail-closed，因此 wrap/reuse 命中旧 CQE 的风险已闭环。若未来必须支持 ID 循环复用，则仍需升级 wire contract 并显式引入 transfer generation；
+- 已有 endpoint 级 posted-RX/JFR depth 硬门禁、process-wide shared RX admission、F/A/P/R/L 守恒校验与分类异常计数；required first window 从等待 native capacity 前开始 FIFO 排队，optional second window 在 native acquire 与 Fabric post 两阶段向 required waiter 让行。per-peer guaranteed/borrowed 已接入生产 admission，静态 quota 配置默认 0；非零 quota 的规模与 Peer 拒绝/fallback 行为仍需压力验证，也没有预先 posted 的 emergency headroom；
 - per-peer `TargetHandle` 尚无 native 级 flush/错误查询接口，target-local 故障（对端 hang）只能靠 drain 超时 + 端点级 flush 兜底，粒度偏粗；
 - 同一远端 descriptor 的多个 control session 目前会分别执行 `import_jetty` 并通过逻辑 alias 消歧；provider 是否允许/复用重复 import 仍需 RM0 真机确认，长期应评估按 remote descriptor 共享 native TargetHandle；
 - 没有真实 provider，无法验证 import-only first-send、shared JFR 多 source、错误 CQE 字段有效性及 target-local 故障隔离。
@@ -1481,20 +1550,21 @@ Runtime
 
 §21.3 原第 1、2 步（提升 shared native endpoint、Peer 只持有 target/control state）已完成，见 §21.1 第 6 项。剩余按依赖顺序推进：
 
-1. **完成 per-peer TransferRegistry**
-   - registry 变为 `PeerTargetRegistry[remote_id] -> peer.TransferRegistry[transfer_id]`；
-   - routing token 明确编码 `transfer_id + transfer generation/sequence`，防止 ID reuse 命中旧 CQE。
+1. **完成 per-peer TransferRegistry（已完成）**
+   - registry 已变为 `PeerTargetRegistry[remote_id] -> peer.TransferRegistry[transfer_id][chunk]`；
+   - routing token 明确编码 `u32 transfer_id + u32 chunk`，transfer id process-wide 分配且不复用，耗尽时 fail-closed；
    - anonymous RX token、`local_id` shared endpoint 校验和 `remote_id + routing_token` completion-time demux 已完成。
 2. **继续拆分故障域**
-   - PeerTarget fault：停止 admission，等待该 target SEND outstanding 收敛，然后 unimport；
-   - 可归属 WR completion error 已触发 PeerTarget drain；普通 target fault 尚缺 native per-target flush/错误查询接口；
+   - PeerTarget fault：Active/generation gate、停止新 admission、清空未消费 remote credit、等待该 target SEND outstanding 收敛再 unimport 已完成；
+   - 可归属 WR completion error 已触发 PeerTarget drain，并已离线验证 sibling Peer 可继续完成 SEND；普通 target fault 尚缺 native per-target flush/错误查询接口；
    - 只有 fabric/device-local fatal 才 mark shared endpoint ERROR、drain all 并重建。
 3. **完善 shared RX credit**
-   - endpoint 级 JFR depth gate 已完成；继续落实完整 `F/P/R/L` buffer 守恒和 posted-RQE reservation；
-   - 增加 global capacity、per-peer logical quota、borrowable surplus、per-transfer pipeline 和未授予 emergency headroom；
-   - over-credit/unknown/stale sender 只能 fail-closed，不能宣称硬件级隔离。
+   - endpoint 级 JFR depth gate、process-wide admission、required/optional fairness、lease-lifetime capacity reservation、可观测的 `F/A/P/R/L` 守恒与异常分类计数已完成；
+   - per-transfer pipeline、borrowable surplus、required-first-window FIFO admission 和 per-peer guarantee 已具备；静态 quota 默认 0，配置非零时采用 `quota × active peers <= shared depth` 的 fail-closed admission，不能兑现新 guarantee 时拒绝该 Peer 并交给上层 fallback。仍需 Linux 压力测试选择合理的非零默认值，目前不能按整窗口盲目预留；
+   - 继续评估未授予/预先 posted emergency headroom；
+   - over-credit/unknown/stale sender 已分类计数但仍只能 fail-closed，不能宣称硬件级隔离；在异常 CQE 能安全消费并回补之前，不实现“只预留但未 prepost”的伪 emergency headroom。
 4. **补离线测试与 provider gate**
-   - 已补 remote alias、anonymous slot、target-local drain 和 shared capacity 单测；继续补 stale generation、credit 状态机和 shutdown flush 组合测试；
+   - 已补 remote alias、anonymous slot、target-local drain、shared capacity、PeerCredit、stale generation、sibling fault isolation 和 shutdown flush 组合测试；
    - 无机器期间允许继续实现并保持默认不宣称可用；
    - 真机恢复后，RM0 capability/source/fault 测试是启用 shared RM 数据面的强制 gate。
 
@@ -1554,7 +1624,7 @@ correctness/fault PASS
 7. `[待实验验证]` RNR retry / timeout / retransmission；
 8. `[待实验验证]` target import/advise/first-send 的真实建链时机；
 9. `[待源码/实验确认]` `URMA_WITH_TAG_MATCHING` 是否对目标 provider 有可用的 per-transfer matching 语义；
-10. `[待实现评估]` global RX credit + per-peer quota 的最小复杂度；
+10. `[已实现，待压测调参]` global RX credit + per-peer guaranteed/borrowed quota；默认 quota 为 0，非零默认值仍需 Linux/真机压力数据；
 11. `[待实验验证]` NO_TAG_MATCHING 下 over-credit/unknown/stale sender 对共享 RQE 的侵占范围和 emergency headroom；
 12. `[待源码/实验确认]` 各 completion status/opcode 下 `remote_id`、routing token、length 字段有效性及故障升级矩阵。
 
@@ -1578,24 +1648,11 @@ CPU/尾延迟
 性能
 ```
 
-### 决定 2：不直接把当前 RC 改成 RM
+### 决定 2：原型分支是 RM-only，RC 基线由分支历史保留
 
-不做：
+`urma-rm-prototype` 不在同一套内部资源对象中兼容 RC：native endpoint、import、shared JFR、completion routing 和 admission 均只实现 RM，内部 transport mode 不再作为运行时选项。provider capability、配置枚举和 DFUR wire 字段仍显式校验 RM，是为了 fail-closed 拒绝不支持 RM 的设备、旧配置或非 RM 对端，不代表保留 RC 数据路径。
 
-```text
-URMA_TM_RC -> URMA_TM_RM
-```
-
-这种常量替换。
-
-应保持：
-
-```text
-RcBackend
-RmBackend
-```
-
-独立演进。
+RC 的可运行基线由原分支/提交保留；若未来需要产品级双后端选择，应在更高层组合已独立验证的 backend，而不是把 RC lifecycle 重新塞回本 RM 分支的 `PeerTarget`/FFI config。
 
 ### 决定 3：RM2 不依赖 tag matching
 
