@@ -1,7 +1,22 @@
 # Dragonfly URMA 真实 Provider 验证 Runbook
 
-更新日期：2026-09-04。本文只把真实 UMDK provider 结果标记为实验证据；编译、mock
+更新日期：2026-09-07。本文只把真实 UMDK provider 结果标记为实验证据；编译、mock
 或本地故障注入不等价于真机验证。
+
+> **RM-only 分支补充说明（2026-09-07）**：本文已有 B5/B6/B8 结果和部分 lane/Jetty 操作描述是
+> RC 历史证据。`urma-rm-prototype` 当前使用 process-wide shared RM endpoint + per-peer imported
+> target，不能把逻辑 `lane_id`/`peer_id` 当作 per-peer native Jetty/JFR。B7 inventory 和 manifest 必须
+> 显式冻结 `transportMode=rm`、TP type、64 KiB message requirement 与
+> `peerGuaranteedRxCredits=0`。
+
+> **当前 RM0 观察（用户初测，尚未归档）**：单节点 `urma_perftest` RM 可运行，跨节点 RM 未跑通。
+> 在精确命令、完整输出、两端 `urma_admin show --all`/`show topo` 和 EID/TP 参数归档前，这不是
+> `[实验验证]`。跨节点最小 RM probe 是 Dragonfly dual case 的强制前置门禁；单节点成功不能替代它。
+
+> 2026-09-07 局部日志：跨节点 RM+CTP `send_bw` 首批 128 个 WR 返回 `CR status 4`，按当前 UMDK
+> 枚举是 `URMA_CR_LOC_ACCESS_ERR`，不是 timeout/RNR；B7 单节点 Dragonfly RM 则在 Parent
+> `urma_import_jetty=-1` 后 `early eof` 并回退 TCP。当前 Dragonfly RM shim 固定选择 RTP，而唯一成功的
+> 单节点 perftest 使用 `--ctp`，应优先做同 binary 的 RTP/CTP 矩阵；未确认前不修改 RM gate 为 passed。
 
 > 当前执行状态：B5/B6 正常路径、budget pressure、多 lane required-first admission，以及 B8 同 lane
 > 并发 Piece/native RX window 已完成真实 provider 验证；`pwritev` 后单任务峰值为 63.51 Gbps，
@@ -9,10 +24,21 @@
 > “尚未开始”。下一轮先用当前 binary 新增的 TX window acquire timing 重跑 L8/TX128，再按证据优化
 > allocator；同时补齐反向 SEND_IMM probe 和第 7 节 outstanding/fault shutdown 矩阵。
 
-B7 自动化工具位于 `tools/urma-b7/`：`discover/plan` 负责只读发现和拓扑冻结，
+B7 自动化工具位于 `/home/yuan/workspace/dev/dragonfly-urma-tools/urma-b7/`：`discover/plan` 负责只读发现和拓扑冻结，
 `prepare/run/cleanup` 默认 dry-run，只有显式 `--execute` 才操作远端。执行路径使用 run-scoped
 YAML/socket/storage/port/origin，按 owner marker、PID cmdline 和精确路径限制启停与清理；使用方法见
-`tools/urma-b7/README.md`。
+该目录的 `README.md`。双节点 RM `run --execute` 只有在 inventory 的 cross-node probe 为 `passed`
+时才放行；诊断性越过门禁必须显式添加 `--allow-unvalidated-rm`，且不能将所得结果当作正式验收。
+
+157、158 当前统一使用 `/home/y30083740/dragonfly`：RM 被测仓库是
+`dragonfly-client-urma-rm`，`dragonfly-client-urma-private` 仅保留为 RC A/B 基线，工具仓库是
+`dragonfly-urma-tools`。原 158 的 `/home/yzd/dragonfly` 路径已失效。当前顶层目录清单没有旧 inventory
+依赖的 `config/`，所以真机执行前还必须恢复/迁移 parent、child 和 scheduler YAML；`discover` 会把缺失
+配置、错误 RM 分支或缺少 release binary 标记为 `incomplete`。
+
+B7 工具本身同时支持 `--profile rm` 和 `--profile rc`，但 profile 分别启动两个独立 checkout。prepare
+manifest 固化 profile、repo、transport 和 RC/RM 各自的 cross-node probe，run/cleanup 不允许隐式切换。
+Dragonfly 的 `urma-rm-prototype` 仍保持 RM-only。
 
 ## 1. 已知可用环境
 

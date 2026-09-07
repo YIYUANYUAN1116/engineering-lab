@@ -1,5 +1,7 @@
 # 阶段 A：最小 Dragonfly Piece over URMA 闭环实施分析
 
+>历史阶段文档：当前实现已在 Phase B/B8 演进到单 persistent lane 多 Piece 原生并发，最新状态见 B7 台账。
+
 > 分析日期：2026-08-25  
 > 范围：Dragonfly `dfdaemon` 之间的 standard Piece Parent → Child 传输  
 > 数据面：UMDK/liburma、RTP + RC、双边 SEND/RECV  
