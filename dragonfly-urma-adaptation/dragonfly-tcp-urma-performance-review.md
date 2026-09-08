@@ -1,6 +1,6 @@
 # Dragonfly TCP / URMA 性能对比
 
-## 1. 测试目的
+## 1. 测试说明
 
 本轮测试主要评估 Dragonfly 在当前环境下使用 URMA 替代 TCP 进行 Peer-to-Peer 数据传输后的性能收益。
 
@@ -14,21 +14,26 @@
 
 ## 2. 测试环境
 
-| 项目 | 配置 |
-|---|---|
-| 测试节点 | 2 台服务器，Parent / Child |
-| Dragonfly workload | `dfget + dfdaemon` |
-| 测试文件 | 1 GiB |
-| TCP 网络 | 25 Gbps Ethernet |
-| NVMe 存储性能 | 顺序读写约 6.6–6.7 GB/s（4 GiB direct I/O 实测） |
-| URMA 设备 | `udmac0d1e2` |
-| URMA 模式 | RTP + RC |
-| URMA Chunk | 64 KiB |
-| URMA Piece | 16 MiB |
-| 数据校验 | CRC32 |
-| Child 写入 | `pwritev` |
+| 项目                 | 配置                                                         |
+| ------------------ | ---------------------------------------------------------- |
+| 测试节点               | 2 台服务器，Parent / Child                                      |
+| 操作系统               | openEuler 24.03 LTS SP3                                    |
+| Linux Kernel       | 6.6.0-145.3.27.158.20260826.b7db8e91096e.oe2403sp3.aarch64 |
+| CPU 架构             | AArch64 / ARM64                                            |
+| CPU 型号             | Kunpeng 950 7592C @ 2.3 GHz                                |
+| Dragonfly workload | `dfget + dfdaemon`                                         |
+| 测试文件               | 1 GiB                                                      |
+| TCP 网络             | 25 Gbps Ethernet                                           |
+| NVMe 存储性能          | 顺序读写约 6.6–6.7 GB/s（4 GiB direct I/O 实测）                    |
+| URMA 设备            | `udmac0d1e2`                                               |
+| URMA 模式            | RTP + RC                                                   |
+| URMA Chunk         | 64 KiB                                                     |
+| URMA Piece         | 16 MiB                                                     |
+| 测试路径               | Parent → Child P2P，关闭回源                                    |
 
 测试结果均以真实 `dfget` 端到端执行时间为口径，包括 Piece 下载、数据传输、CRC 校验、落盘和任务收尾。
+
+测试口径：每组配置先进行 1 次预热，随后执行 3 次有效测试，表中结果均取 3 次 有效测试的平均值。
 
 ---
 
@@ -117,7 +122,6 @@ CC32  ≈ 151 ms
 这里的 L8 表示：
 
 > **一个 Parent 同时服务 8 个独立 Peer。**
-
 
 ### 5.1 测试结果
 
