@@ -232,8 +232,6 @@ flowchart LR
 
 ```
 
-
-
 ### 图 5-3 TX slot 生命周期
 
 ```mermaid
