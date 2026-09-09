@@ -1,6 +1,6 @@
 # Dragonfly URMA 真实 Provider 验证 Runbook
 
-更新日期：2026-09-07。本文只把真实 UMDK provider 结果标记为实验证据；编译、mock
+更新日期：2026-09-09。本文只把真实 UMDK provider 结果标记为实验证据；编译、mock
 或本地故障注入不等价于真机验证。
 
 > **RM-only 分支补充说明（2026-09-07）**：本文已有 B5/B6/B8 结果和部分 lane/Jetty 操作描述是
@@ -15,8 +15,8 @@
 
 > 2026-09-07 局部日志：跨节点 RM+CTP `send_bw` 首批 128 个 WR 返回 `CR status 4`，按当前 UMDK
 > 枚举是 `URMA_CR_LOC_ACCESS_ERR`，不是 timeout/RNR；B7 单节点 Dragonfly RM 则在 Parent
-> `urma_import_jetty=-1` 后 `early eof` 并回退 TCP。当前 Dragonfly RM shim 固定选择 RTP，而唯一成功的
-> 单节点 perftest 使用 `--ctp`，应优先做同 binary 的 RTP/CTP 矩阵；未确认前不修改 RM gate 为 passed。
+> `urma_import_jetty=-1` 后 `early eof` 并回退 TCP。RM 分支现已支持 `tpType: rtp|ctp`，并在 wire/import
+> 层拒绝 TP 不一致；该实现仍待真机验证。应优先做同 binary 的 RTP/CTP 矩阵，未确认前不修改 RM gate。
 
 > 当前执行状态：B5/B6 正常路径、budget pressure、多 lane required-first admission，以及 B8 同 lane
 > 并发 Piece/native RX window 已完成真实 provider 验证；`pwritev` 后单任务峰值为 63.51 Gbps，
@@ -25,10 +25,11 @@
 > allocator；同时补齐反向 SEND_IMM probe 和第 7 节 outstanding/fault shutdown 矩阵。
 
 B7 自动化工具位于 `/home/yuan/workspace/dev/dragonfly-urma-tools/urma-b7/`：`discover/plan` 负责只读发现和拓扑冻结，
+`probe-provider` 负责隔离执行并归档 `urma_perftest` 前置矩阵，
 `prepare/run/cleanup` 默认 dry-run，只有显式 `--execute` 才操作远端。执行路径使用 run-scoped
 YAML/socket/storage/port/origin，按 owner marker、PID cmdline 和精确路径限制启停与清理；使用方法见
 该目录的 `README.md`。双节点 RM `run --execute` 只有在 inventory 的 cross-node probe 为 `passed`
-时才放行；诊断性越过门禁必须显式添加 `--allow-unvalidated-rm`，且不能将所得结果当作正式验收。
+时才放行；诊断性越过门禁必须显式添加 `--allow-unvalidated-urma`，且不能将所得结果当作正式验收。
 
 157、158 当前统一使用 `/home/y30083740/dragonfly`：RM 被测仓库是
 `dragonfly-client-urma-rm`，`dragonfly-client-urma-private` 仅保留为 RC A/B 基线，工具仓库是
@@ -55,6 +56,35 @@ provider chunk  65536 bytes
 
 上机前先用 `urma_perftest send_bw -p 1` 或 demo 复验。该环境必须使用 `eidIndex: 1`，
 不能盲用配置示例中的默认 0。
+
+### 1.1 B7 provider 前置探测
+
+先检查 dry-run 生成的两端命令，再显式执行。`--server-address` 必须填写 server 的 URMA EID 地址，不能
+填写或推断 SSH 管理地址：
+
+```bash
+cd /home/y30083740/dragonfly/dragonfly-urma-tools/urma-b7
+
+# RM 默认覆盖 RTP 和 CTP。
+python3 b7.py probe-provider --profile rm --mode dual \
+  --server-address 90.91.177.158 --run-id rm-provider-001
+python3 b7.py probe-provider --profile rm --mode dual \
+  --server-address 90.91.177.158 --run-id rm-provider-001 --execute
+
+# 单节点闭环；仍传本节点的 URMA EID。
+python3 b7.py probe-provider --profile rm --mode single --host node1 \
+  --server-address 90.91.177.158 --run-id rm-loopback-001 --execute
+
+# RC 对照默认只运行 RTP。
+python3 b7.py probe-provider --profile rc --mode dual \
+  --server-address 90.91.177.158 --run-id rc-provider-001 --execute
+```
+
+证据保存在 `results/<run-id>/provider-probe.json`，包含精确 argv、shell 展示、两端 stdout/stderr/退出码、
+耗时、解析后的 `Failed CR status` 和 `discover` 环境快照。工具始终显式传 inventory 的
+`--eid_idx 1`。`urma_perftest -O` 表示 priority，并非 opcode；默认不指定，由 perftest/provider 按 TP
+选择。只有复现旧命令时才添加 `--priority 6`。默认消息为 4096 bytes，保证 RM+CTP 与 RM+RTP 使用共同
+合法尺寸；64 KiB 能力另在 RTP/Dragonfly 分片路径验证。
 
 ## 2. 构建
 

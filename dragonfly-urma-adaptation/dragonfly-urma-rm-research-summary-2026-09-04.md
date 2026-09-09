@@ -1281,13 +1281,15 @@ P2P 可用。
   在首批 128 个 SEND completion 上返回 `CR status 4`。当前 UMDK `urma_cr_status_t` 中数值 4 是
   `URMA_CR_LOC_ACCESS_ERR`，不是 ACK timeout（9）或 RNR retry exceeded（10）；因此应先核对发起端 MR/
   token、两端 binary SHA/版本及完整 server/client 参数，不能先归因于网络不通。当前只收到一侧命令与
-  摘要输出，仍不足以形成可复现实验；
+  摘要输出，仍不足以形成可复现实验。这里 `-O 6` 表示 priority 6，并非 opcode；收到的命令也没有显式
+  `--eid_idx 1`，下一轮标准矩阵默认不传 `-O`、但必须显式传 inventory 中已知的 EID index；
 - B7 单节点 RM case 的内容最终匹配，但日志明确显示 URMA rendezvous `early eof`，Parent 多次在
   `urma_import_jetty` 返回 `-1` 后退役 Peer，随后走 TCP fallback。因此这轮不是 URMA PASS，B7 的拒绝
   判定正确，失败点位于任何数据 WR 之前；
-- 当前 RM shim 创建 shared Jetty 时固定按 RTP capability 选 priority，import 路径没有 CTP profile；而目前
-  唯一成功的单节点 perftest 明确带 `--ctp`。RTP/CTP 不一致是 Dragonfly `import_jetty` 失败的最高优先级
-  假设，但仍需用相同 binary 分别执行 RM+RTP 与 RM+CTP 最小矩阵并保存 UMDK/provider 日志后确认。
+- 当时 RM shim 创建 shared Jetty 时固定按 RTP capability 选 priority，import 路径没有 CTP profile；当前
+  分支已增加 `tpType: rtp|ctp`、对应 priority 查询和 import 前 TP 校验，但尚未经真机验证。仍需用相同
+  binary 分别执行 RM+RTP 与 RM+CTP 最小矩阵并保存 UMDK/provider 日志，确认改造是否解决
+  `import_jetty=-1`，以及跨节点 status 4 是否属于独立问题。
 
 ### 20.1 Capability
 
@@ -1671,7 +1673,7 @@ correctness/fault PASS
 
 ---
 
-## 21.1 2026-09-07：RM 的 RTP/CTP 可配置化（待真机验证）
+### 21.6 2026-09-07：RM 的 RTP/CTP 可配置化（待真机验证）
 
 针对单机 `urma_perftest --ctp` 可运行、Dragonfly 固定 RTP 且在 `import_jetty` 失败的新证据，RM 原型已完成以下离线改造：
 
@@ -1693,6 +1695,21 @@ B7：91 passed；py_compile / inventory JSON / diff check passed
 ```
 
 该改造只增加 RM 内部的 TP profile 选择，没有恢复 RC 数据路径。它也尚未证明 CTP 能解决真机 import 或跨节点 status 4；下一次真机必须使用同一 binary/config hash 分别执行 RTP/RTP、CTP/CTP 和 mismatch fail-closed 对照。
+
+### 21.7 2026-09-09：B7 provider probe 自动化（待真机执行）
+
+- 新增 `probe-provider`，同时支持 RM checkout 和独立 RC baseline checkout；RM 默认运行 RTP/CTP 两个
+  `send_bw` case，RC 默认仅运行 RTP；
+- 同时支持 single-node loopback 与 dual-node，双节点默认 node1 server、node2 client；`-S` 地址必须由
+  `--server-address` 显式提供 URMA EID，禁止从 SSH 管理地址推断；
+- 命令固定使用 inventory 的 device 与 `--eid_idx`。默认不传代表 priority 的 `-O`；只有复现旧实验时
+  才用 `--priority` 显式设置；共同默认消息尺寸为 4096 bytes，避免拿 CTP 不支持的 64 KiB 做首轮矩阵；
+- 默认 dry-run，仅 `--execute` 启动两端 perftest；server 有远端 timeout，client/server 并发执行，避免
+  阻塞进程遗留；
+- `provider-probe.json` 归档两端精确 argv/shell、stdout/stderr、退出码、耗时、timeout、解析后的
+  `Failed CR status` 名称，以及 `discover` 的 repo/binary/admin/topology/network 快照；工具不会自动把
+  inventory gate 改为 `passed`，仍需人工审阅成功证据；
+- B7 单元测试 98/98 与 RM dual dry-run 通过；尚未执行真实 SSH/provider 操作。
 
 ---
 
