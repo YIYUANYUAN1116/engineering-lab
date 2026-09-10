@@ -156,47 +156,30 @@ Window A 进入 CRC32/Storage 消费时，Window B 继续接收下一批网络�
 
 ```mermaid
 flowchart LR
-    P["Parent<br/>按 64 KiB Chunk SEND_IMM"]
+    P["RX Pool<br/>32 MiB / 512 slots"]
 
-    subgraph POOL["Process-wide Registered RX Buffer Pool"]
-        R["64 KiB slots<br/>slot 0 / 1 / 2 / ... / N"]
-    end
+    P --> A["Window A<br/>16 slots = 1 MiB"]
+    P --> B["Window B<br/>16 slots = 1 MiB<br/>可选"]
 
-    R -.->|lease / RQE slots| A["申请 RX Window<br/>同时取得 pipeline/admission credit"]
-    A --> WA["Window A<br/>16 slots = 1 MiB<br/>required"]
-    A --> WB["Window B<br/>16 slots = 1 MiB<br/>optional"]
+    A --> A1["post RECV<br/>成功后发 RecvPosted"]
+    B --> B1["post RECV<br/>成功后发 RecvPosted"]
 
-    WA --> PA["post RECV A<br/>全部成功后发送 RecvPosted A"]
-    WB --> PB["post RECV B<br/>全部成功后发送 RecvPosted B"]
-    PA --> P
-    PB --> P
+    A1 --> A2["NIC 接收 A<br/>16 个 CQE"]
+    B1 --> B2["NIC 接收 B<br/>16 个 CQE"]
 
-    P --> DA["NIC DMA Window A<br/>每个 Chunk 一个 RECV CQE"]
-    P --> DB["NIC DMA Window B<br/>每个 Chunk 一个 RECV CQE"]
+    A2 --> A3["A → CRC + 写盘"]
+    B2 --> B3["B → CRC + 写盘"]
 
-    DA --> CA["A 的全部 Chunk 完成<br/>publish RegisteredRxWindowLease A"]
-    CA --> PIPE["Double Window Pipeline<br/>CRC/pwrite A ∥ NIC receive B"]
-    DB --> PIPE
+    A3 --> A4["A slots 回 RX Pool"]
+    B3 --> B4["B slots 回 RX Pool"]
 
-    PIPE --> CB["B 的全部 Chunk 完成<br/>publish Lease B"]
-    PIPE --> SA["CRC32 + pwrite/pwritev A"]
-    CB --> SB["CRC32 + pwrite/pwritev B"]
+    A4 --> P
+    B4 --> P
 
-    SA --> RA["A 的所有 consumer 完成<br/>recycle A slots"]
-    SB --> RB["B 的所有 consumer 完成<br/>recycle B slots"]
-    RA --> NEXT["A/B 交替申请、接收和消费<br/>下一批 Chunks"]
-    RB --> NEXT
-    NEXT --> DONE["Piece RX complete"]
 ```
+RX 双 Window 的目的，是让 Window A 被 Storage 消费时，Window B 仍可接收下一批数据：
 
-`RecvPosted` 只能在对应 Window 的全部 RECV WR 实际 post 成功后发送，否则 Parent 可能向尚无接收
-Buffer 的 credit 发送数据。RECV CQE 只表示 NIC 已把数据写入 registered RX；Window 必须等全部 Chunk
-完成才可发布，发布后还要等 CRC32 和 pwrite/pwritev 等 consumer 完成才能回收 slots。
-
-Window B 同样是可选流水线资源：RX registered budget、JFR/RQE depth 或 admission 不足时退化为单
-Window，功能保持不变，只是网络接收不能与上一 Window 的 Storage 消费充分重叠。RC 中 A/B 对应 Lane
-上明确 post 的 RX slots；RM 中 A/B 是逻辑 receive Window，shared JFR 的匿名 RQE 与 Peer/Transfer
-要到 CQE 返回后，才能通过 `user_ctx + remote_id + SEND_IMM` 汇合，具体见 4.4 节。
+因此双 Window 同时在两端隐藏不同的等待：TX 侧隐藏 source fill 与 SEND completion，RX 侧隐藏网络接收与 CRC/存储消费。
 
 ## 3. RC 方案
 
@@ -366,26 +349,6 @@ flowchart TD
 NIC DMA → registered RX spans → CRC32 / pwritev → recycle
 ```
 
-RX 双 Window 的目的，是让 Window A 被 Storage 消费时，Window B 仍可接收下一批数据：
-
-```mermaid
-sequenceDiagram
-    participant N as NIC/Provider
-    participant A as RX Window A
-    participant B as RX Window B
-    participant S as CRC32/Storage
-    N->>A: DMA Window A + RECV CQE
-    A->>S: 交付 Lease A
-    Note over A,S: A 未完成 CRC/写盘，不能 repost
-    N->>B: DMA Window B（与消费 A 重叠）
-    B->>S: 交付 Lease B
-    S-->>A: CRC/pwrite 完成，recycle A
-    A->>N: repost A 接收下一 Window
-    S-->>B: CRC/pwrite 完成，recycle B
-```
-
-因此双 Window 同时在两端隐藏不同的等待：TX 侧隐藏 source fill 与 SEND completion，RX 侧隐藏网络接收与 CRC/存储消费。
-
 ### 3.5 RC completion 身份
 
 RC 路由可以概括为：
@@ -444,20 +407,21 @@ RM 删除的是应用层 per-peer local Jetty/JFR/bind/Lane，不是删除远端
 
 ```mermaid
 sequenceDiagram
-    participant C as Child Peer Session
-    participant CF as Child Shared Fabric
-    participant PF as Parent Shared Fabric
-    participant P as Parent Peer Session
-    C->>CF: create PeerTarget(id, generation)
-    P->>PF: create PeerTarget(id, generation)
-    Note over CF,PF: shared RM endpoint 仅首次创建，后续 Peer 复用
-    C->>P: capability + TP type + shared descriptor
-    P->>C: capability + TP type + shared descriptor
-    CF->>CF: validate + import Parent TargetHandle
-    PF->>PF: validate + import Child TargetHandle
-    CF->>CF: authorize remote_id
-    PF->>PF: authorize remote_id
-    Note over C,P: PeerTarget Ready；无 per-peer bind
+    participant C as Child
+    participant P as Parent
+
+    Note over C,P: 双方已有 / 首次创建 shared RM endpoint
+
+    C->>P: TCP 发送本地 RM descriptor
+    P->>C: TCP 发送本地 RM descriptor
+
+    C->>C: import Parent descriptor<br/>得到 Parent TargetHandle
+    P->>P: import Child descriptor<br/>得到 Child TargetHandle
+
+    C->>C: 登记 Parent remote_id
+    P->>P: 登记 Child remote_id
+
+    Note over C,P: PeerTarget Ready<br/>后续 SEND 显式指定 TargetHandle
 ```
 
 ```text
@@ -493,19 +457,17 @@ RM 的 A/B 双 Window 时序与 3.3 节一致；区别是多个 PeerTarget 的 W
 
 ```mermaid
 flowchart LR
-    A[Task file] --> B[申请并 fill TxWindowLease]
-    B --> C{PeerTarget Ready<br/>generation 有效?}
-    C -- 否 --> X[拒绝并退休 stale Peer]
-    C -- 是 --> D{RecvPosted credit 足够?}
-    D -- 否 --> E[等待该 Peer credit]
-    E --> D
-    D -- 是 --> F[reserve completion identity]
-    F --> G[shared JFS post SEND_IMM<br/>显式 TargetHandle]
-    G --> H{provider 接受多少 WR?}
-    H --> I[commit posted prefix]
-    H --> J[回滚未 post suffix]
-    I --> K[SEND CQE]
-    K --> L[按 user_ctx 路由并回收 TX Window]
+    A[Task file] --> B[fill TX Window]
+    B --> C{PeerTarget 有效?}
+    C -- 否 --> X[停止发送]
+    C -- 是 --> D{有 RecvPosted credit?}
+    D -- 否 --> D
+    D -- 是 --> E[shared JFS SEND<br/>指定 TargetHandle]
+    E --> F{实际 post 成功几条?}
+    F --> G[成功的等 CQE]
+    F --> H[没成功的回滚]
+    G --> I[根据 user_ctx 找到 TX slot]
+    I --> J[全部完成后回收 Window]
 ```
 
 ```text
