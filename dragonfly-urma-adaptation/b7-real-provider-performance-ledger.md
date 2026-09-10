@@ -1,6 +1,6 @@
 # B7 真实 Provider 性能验证台账
 
-更新时间：2026-09-04。
+更新时间：2026-09-10。
 
 本文记录 Dragonfly URMA Phase B 在真实 provider、node1 parent / node2 child 环境中的性能实验。
 它只登记已经取得的实验数据、统计口径和由数据支持的结论；并发、多 peer、故障和 shutdown 结果在完成
@@ -20,6 +20,10 @@
 - 当前 HEAD 已记录 TX required/optional window 的总 acquire 和 pool 本体耗时，工具也已支持汇总。
   下一验证点是在严格 cleanup、交替 A/B 的 L8/TX128 基线上量化 allocator；在取得该数据前，不把
   allocator 认定为唯一根因。
+- `[源码确认，尚待真机优化验证]` 当前 linked SEND post-list 只减少 native post/doorbell 调用，list 内
+  每条 SEND WR 仍设置 `complete_enable=1`，因此 N 条成功 post 的 SEND 会产生 N 条 SEND CQE。上层虽只在
+  整个 Window 的 CQE 全部退休后收到一次 Window completion，但这不等于 native 层已经使用 CQ moderation。
+  TX selective completion/frontier retirement 尚未接入当前 RC/RM production path。
 
 仍未闭环：完整 fault/outstanding shutdown 矩阵、SEND_IMM 反向 probe、多物理 Child 扩展，以及
 transport-only、owner/CQ、CPU/NUMA、CRC32/Storage 的分层 profile。
@@ -774,3 +778,52 @@ progress thread；每个 Piece 单独建立 TCP rendezvous，并以独立 tag �
 其 concurrency=1..32 是“单 endpoint 多 Piece”，不是多 lane/QP。上述 L8×CC8 profile 用于寻找 URMA
 总饱和上限；要和 RDMA 曲线解释同一并发维度，还必须另跑单 persistent lane 的 Piece CC sweep，并在
 报告中同时写明 lane count 与 per-lane CC。
+
+### 12.11 linked post-list 与 TX CQ moderation 状态（2026-09-10 源码复核）
+
+`[源码确认]` 当前 Dragonfly URMA 的 `postListSize=N` 语义是把 N 条 WR 串成 linked list，通过一次
+`urma_post_jetty_send_wr()` 提交；它不是“N 条 SEND 只产生一条 CQE”。C shim 对 list 内每条 SEND 都设置：
+
+```c
+wr->send_wr.flag.bs.complete_enable = 1;
+```
+
+因此当前行为是：
+
+| 一个 16-Chunk Window 的配置 | native post 调用数 | SEND CQE 数 | 上层 Window completion |
+|---|---:|---:|---:|
+| `postListSize=1` | 16 | 16 | 1 |
+| `postListSize=4` | 4 | 16 | 1 |
+| `postListSize=16` | 1 | 16 | 1 |
+
+当前正确性记账为：
+
+1. native post 前为每条 WR 预留 `user_ctx` 和 slot completion identity；
+2. post 返回后只 commit provider 实际接受的 prefix；
+3. `RegisteredTxWindowState.pending` 按已接受 WR 数增加；
+4. 每条 SEND CQE 使 `pending` 减一并恢复对应 TX slot 的可回收状态；
+5. 仅当 `posting_finished && pending == 0`，才向上层交付一次 Window completion 和完整
+   `TxWindowLease`；
+6. partial post 只扣成功 prefix 的 RecvPosted credit，未 post suffix 回滚。
+
+JFC poll 一次可批量取回多条 CQE，这只降低 poll 调用次数，也不等于 selective completion。
+
+`[历史设计确认]` `urma-transport-lab` 和 `urma_perftest` 曾使用真实 CQ moderation：中间 WR 设置
+`complete_enable=0`，每 N 条或批次尾部强制 signaled；尾部 CQE 作为 retirement frontier，一次证明此前
+WR 已完成。当前 production shim 没有迁入该 frontier 模型，所以 64 KiB Chunk 下仍承担 per-WR CQE、
+completion routing 和 slot bookkeeping 成本。
+
+该项列为后续性能优化候选，但必须在目标 provider 上先验证 ordering 和错误语义：
+
+- RC 可按每条 Lane/JFS 维护单调 `post_seq` 与 retirement frontier；
+- RM 多个 PeerTarget 共用 JFS，必须确认完成顺序是 shared JFS 全局有序，还是仅同 Target/TP 有序；
+- 若只保证同 Target 有序，必须维护 per-PeerTarget frontier，不能用 Peer A 的尾 CQE 回收 Peer B 的 WR；
+- 每个 Window/批次尾部、低流量超时点和 shutdown 前必须强制 signaled，避免没有 frontier 导致 TX slot
+  永久不能回收；
+- partial post、错误 CQE 和 Peer retirement 必须保留精确的 posted prefix/owner 记账；
+- RX CQE 携带实际 slot、长度、`remote_id` 和 `SEND_IMM`，不能直接采用 TX 的 selective completion。
+
+建议真机顺序：先保持 per-WR CQE 完成 RM 跨节点正确性门禁；随后在 RC 基线分别测试 moderation
+`1/8/16/32/100`，确认吞吐、CQE/s、owner CPU、slot 回收和故障矩阵；最后在 ordering 语义明确后移植到
+RM shared-JFS 路径。未取得该数据前，只把“CQE 频率是候选软件瓶颈”登记为源码分析，不宣称它是当前
+134 Gbps 的唯一根因。

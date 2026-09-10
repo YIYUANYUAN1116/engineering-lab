@@ -232,7 +232,7 @@ flowchart LR
 
 ```
 
-### 图 5-3 TX slot 生命周期
+### 图 5-2 TX slot 生命周期
 
 ```mermaid
 stateDiagram-v2
@@ -264,35 +264,64 @@ production RX 路径已去掉额外 userspace staging copy：NIC DMA → registe
 ### 图 6-1 RC RX 主路径
 
 ```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Child
-    participant RX as Registered RX Pool / JFR
-    participant P as Parent
-    participant ST as Child Storage
+flowchart LR
 
-    C->>RX: reserve complete RX Window
-    loop Window 内每个 Chunk
-        C->>RX: post RECV WR(user_ctx=slot/gen)
-    end
-    C->>P: RecvPosted / receive credit
-
-    loop Window 内每个 Chunk
-        P->>C: SEND_IMM(payload, transfer/chunk)
-        RX-->>C: RECV CQE
-        C->>C: CompletionRouter 校验
+    %% =========================
+    %% RX Registered Buffer Pool
+    %% =========================
+    subgraph POOL["Process-wide Registered RX Buffer Pool"]
+        P["64 KiB slots<br/>[0][1][2]...[N]"]
     end
 
-    C->>ST: RegisteredRxWindowLease
+    A["acquire RegisteredRxWindowLease<br/>从 Pool 申请空闲 slots"]
 
-    par CRC32
-        ST->>ST: digest
-    and positional write
-        ST->>ST: pwrite / pwritev
-    end
+    P -.-> A
 
-    ST-->>C: consumers complete
-    C->>RX: recycle RX Window
+    A --> WA["Window A<br/>16 slots = 1 MiB"]
+    A --> WB["Window B<br/>16 slots = 1 MiB<br/>optional"]
+
+    %% =========================
+    %% Post RECV
+    %% =========================
+    WA --> PRA["post RECV for Window A<br/>16 × 64 KiB"]
+    WB --> PRB["post RECV for Window B<br/>16 × 64 KiB"]
+
+    PRA --> READY["整个 Window RECV 全部 post 成功"]
+    PRB --> READY
+
+    READY --> CREDIT["发送 RecvPosted / credit<br/>通知 Parent 可以 SEND"]
+
+    %% =========================
+    %% Receive Data
+    %% =========================
+    CREDIT --> DMA["Parent SEND_IMM<br/>NIC DMA 写入 registered RX slots"]
+
+    DMA --> CQ["RECV CQE<br/>user_ctx + local_id + imm_data"]
+
+    CQ --> ROUTE["CompletionRouter<br/>校验 slot / generation / transfer / chunk"]
+
+    %% =========================
+    %% Window Complete
+    %% =========================
+    ROUTE --> COMPLETE["Window 内所有 Chunk 收齐"]
+
+    COMPLETE --> STORAGE["RegisteredRxWindowLease<br/>交给 Storage"]
+
+    STORAGE --> CRC["CRC32"]
+    STORAGE --> WRITE["pwrite / pwritev"]
+
+    CRC --> JOIN["两个 consumer 都完成"]
+    WRITE --> JOIN
+
+    %% =========================
+    %% Recycle
+    %% =========================
+    JOIN --> RE["Window retire / recycle<br/>slots 可重新 post RECV"]
+
+    RE --> NEXT["A/B 交替复用<br/>继续接收后续 Window"]
+
+    NEXT --> DONE["Piece RX complete"]
+
 ```
 
 ### 图 6-2 RX slot 生命周期
