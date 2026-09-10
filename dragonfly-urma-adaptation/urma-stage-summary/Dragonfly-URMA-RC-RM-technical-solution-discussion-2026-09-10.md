@@ -149,6 +149,55 @@ flowchart LR
 
 图中的“双 Window”不是两块永久保留的独立注册内存，而是同一 TX Pool 上的两个临时 lease。Window B 申请失败时会安全退化为单 Window；Window A/B 只有在各自已 post 的全部 SEND CQE 收敛后才能 refill。当前 linked post-list 可以减少 native post/doorbell 次数，但仍是每个 Chunk 一个 CQE，具体见 8.5 节。
 
+### 2.3 RX Pool 与 A/B 双 Window 完整流水线
+
+RX 双 Window 使用同一个 process-wide registered RX Pool。它的目的不是隐藏 source fill，而是让
+Window A 进入 CRC32/Storage 消费时，Window B 继续接收下一批网络数据：
+
+```mermaid
+flowchart LR
+    P["Parent<br/>按 64 KiB Chunk SEND_IMM"]
+
+    subgraph POOL["Process-wide Registered RX Buffer Pool"]
+        R["64 KiB slots<br/>slot 0 / 1 / 2 / ... / N"]
+    end
+
+    R -.->|lease / RQE slots| A["申请 RX Window<br/>同时取得 pipeline/admission credit"]
+    A --> WA["Window A<br/>16 slots = 1 MiB<br/>required"]
+    A --> WB["Window B<br/>16 slots = 1 MiB<br/>optional"]
+
+    WA --> PA["post RECV A<br/>全部成功后发送 RecvPosted A"]
+    WB --> PB["post RECV B<br/>全部成功后发送 RecvPosted B"]
+    PA --> P
+    PB --> P
+
+    P --> DA["NIC DMA Window A<br/>每个 Chunk 一个 RECV CQE"]
+    P --> DB["NIC DMA Window B<br/>每个 Chunk 一个 RECV CQE"]
+
+    DA --> CA["A 的全部 Chunk 完成<br/>publish RegisteredRxWindowLease A"]
+    CA --> PIPE["Double Window Pipeline<br/>CRC/pwrite A ∥ NIC receive B"]
+    DB --> PIPE
+
+    PIPE --> CB["B 的全部 Chunk 完成<br/>publish Lease B"]
+    PIPE --> SA["CRC32 + pwrite/pwritev A"]
+    CB --> SB["CRC32 + pwrite/pwritev B"]
+
+    SA --> RA["A 的所有 consumer 完成<br/>recycle A slots"]
+    SB --> RB["B 的所有 consumer 完成<br/>recycle B slots"]
+    RA --> NEXT["A/B 交替申请、接收和消费<br/>下一批 Chunks"]
+    RB --> NEXT
+    NEXT --> DONE["Piece RX complete"]
+```
+
+`RecvPosted` 只能在对应 Window 的全部 RECV WR 实际 post 成功后发送，否则 Parent 可能向尚无接收
+Buffer 的 credit 发送数据。RECV CQE 只表示 NIC 已把数据写入 registered RX；Window 必须等全部 Chunk
+完成才可发布，发布后还要等 CRC32 和 pwrite/pwritev 等 consumer 完成才能回收 slots。
+
+Window B 同样是可选流水线资源：RX registered budget、JFR/RQE depth 或 admission 不足时退化为单
+Window，功能保持不变，只是网络接收不能与上一 Window 的 Storage 消费充分重叠。RC 中 A/B 对应 Lane
+上明确 post 的 RX slots；RM 中 A/B 是逻辑 receive Window，shared JFR 的匿名 RQE 与 Peer/Transfer
+要到 CQE 返回后，才能通过 `user_ctx + remote_id + SEND_IMM` 汇合，具体见 4.4 节。
+
 ## 3. RC 方案
 
 ### 3.1 RC 资源模型
@@ -263,24 +312,6 @@ fill A → send A ─────────→ CQE A → refill A
 ```
 
 发送侧的重叠关系如下。A 已 post 后，CPU 可以填充 B；但 A 必须等自己的 SEND CQE，才能进入下一轮 refill：
-
-```mermaid
-sequenceDiagram
-    participant S as Source/CPU
-    participant A as TX Window A
-    participant B as TX Window B
-    participant N as NIC/Provider
-    S->>A: fill Window A
-    A->>N: post SEND chunks A
-    Note over A,N: A 仍归 provider/NIC 所有，不能 refill
-    S->>B: fill Window B（与 send A 重叠）
-    B->>N: post SEND chunks B
-    N-->>A: SEND CQE A
-    S->>A: refill 下一 Window（与 send B 重叠）
-    A->>N: post 下一批 chunks A
-    N-->>B: SEND CQE B
-    S->>B: refill 下一 Window
-```
 
 若第二个 Window 只是性能型 optional lease，申请不到时会退化为 ring1：
 
@@ -1220,9 +1251,17 @@ flowchart LR
 
 当前 TX 即使使用 mmap，也仍要把 source 内容复制进 registered TX window。RM 沿用了该路径，因此切换 RM 不会消除这一瓶颈。
 
+当前 Reader fallback 也不是真正的 file-direct-to-TX：`RangeReader` 先用 `read_at()` 填内部
+`BytesMut`，随后 `read_exact(dst)` 再复制到 registered TX。文件可以直接读入 TX，限制不在 URMA，
+而在现有异步接口和 lease ownership：安全实现需要把整个 `TxWindowLease` 移入 blocking task，使用
+Window 级 `pread/preadv` 填充后再归还发送路径，并保证 outstanding SEND CQE 收敛前不能 refill。
+该方案可消除 Reader 的 staging copy，但相对 mmap-copy 仍是一次 page-cache-to-TX 搬运，性能必须 A/B
+验证；不建议机械地每 64 KiB 做一次 syscall。
+
 需要继续验证的方向：
 
 - source file 直接注册或更接近零拷贝的 TX 路径；
+- `RangeReader`、mmap-copy 与 Window 级 direct `pread/preadv` 三路 source-fill 对照；
 - 以第 7 章的 read-only file-mmap READ 为独立对照实验，验证其能否绕过 source fill；该方向尚未通过 provider、注册成本、GC 和安全门禁，不能预设为替代方案；
 - larger chunk / gather list，降低每字节 WR/CQE 成本；
 - fill 与 send 的 CPU/NUMA 亲和性；
@@ -1317,11 +1356,37 @@ RX 已去除额外 staging copy，但仍有：
 
 因此 `RX registered bytes`、Window size 和 pipelineDepth 需要根据 consumer latency 调优，不能简单与 TX budget 对称配置。
 
-### 8.7 pool 大小和 allocator/bookkeeping
+### 8.7 TX Window allocator 的全池扫描与 bookkeeping
 
-已有测试中 TX160 比 TX128 更慢，扩大 registered pool 没有线性收益。可能原因包括 slot acquire 扫描、retain/bookkeeping、cache locality 或 NUMA，但尚未证明。
+当前 TX Window allocator 不是从空闲 extent 或连续区间索引中直接取得一个 Window。每次调用 `acquire_tx_window_chunks()`，都会在 process-wide owner thread 上执行以下工作：
 
-因此 registered memory 优化应以“同时活跃的 Window working set”为依据，而不是越大越好。
+```mermaid
+flowchart LR
+    A["申请 W 个 TX slots"] --> B["扫描全部 T 个 TX slots<br/>统计 Free 数量"]
+    B --> C["复制全部 T 个 slot state<br/>生成临时 Vec"]
+    C --> D["windows(W) 搜索<br/>第一段连续 Free slots"]
+    D --> E["对选中的每个 slot<br/>执行 free_tx.retain()"]
+    E --> F["生成 spans/layouts/LeaseBook 记录"]
+```
+
+其中：
+
+- `available` 统计会线性扫描整个 TX slot 区，成本为 `O(T)`；
+- 连续区搜索先复制全部 TX slot state，再通过 `windows(W)` 查找；最坏可接近 `O(T × W)`，并且每次申请产生临时 `Vec`；
+- 选中 W 个 slot 后，每个 slot 都执行一次 `free_tx.retain()`；`retain()` 会扫描当前 free list，因此这一段约为 `O(W × F)`；
+- 以上工作与 native resource mutation、post 和 CQ poll 共用一个 owner thread，allocator 变慢不仅延迟本 Transfer，还可能推迟其他 Peer 的 post/completion progress；
+- RX 使用 `VecDeque` 逐个 `pop_front()`，没有同样的连续 TX Window 全池搜索路径，不能把该结论笼统扩展到 RX allocator。
+
+典型 TX128 MiB、64 KiB slot 对应 `T=2048`，一个 1 MiB Window 对应 `W=16`；TX160 MiB 时 `T=2560`。已有测试中 TX160 比 TX128 慢 21.43%，扩大 registered pool 没有线性收益。当前 allocator 会随 T 增大而放大串行扫描和 `retain` bookkeeping，因此它是有源码依据的高优先级候选瓶颈。
+
+但现有数据仍不能证明 allocator 是 TX160 下降或 134 Gbps 上限的唯一根因，cleanup、page cache/writeback、NUMA 和 source fill 仍可能共同影响结果。代码已经分别记录：
+
+- `tx_required_acquire_ns`：required Window 的完整等待时间，包含重复尝试、retry sleep、owner command 排队和处理；
+- `tx_optional_acquire_ns`：optional Window 单次非阻塞尝试的端到端时间，包含 owner command 排队和处理；
+- `tx_required_pool_acquire_ns` / `tx_optional_pool_acquire_ns`：lease 内记录的 allocator 本体时间；
+- required/optional acquire attempts：用于区分 allocator 成本和 pool pressure/retry。
+
+因此 registered memory 优化应以“同时活跃的 Window working set”为依据，而不是越大越好。下一步应在严格 cleanup、交替 TX128/TX160 的相同 workload 下，对比 required/optional acquire 与 pool-acquire 的 p50/p95/p99；若确认 allocator 占比显著，再把 TX 空闲结构改为 free extent/区间索引，使正常分配接近 `O(W)` 或 `O(log E + W)`，而不是先扩大注册池。
 
 ### 8.8 RM 当前第一阻塞不是 Dragonfly 性能
 

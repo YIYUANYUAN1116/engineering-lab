@@ -827,3 +827,47 @@ completion routing 和 slot bookkeeping 成本。
 `1/8/16/32/100`，确认吞吐、CQE/s、owner CPU、slot 回收和故障矩阵；最后在 ordering 语义明确后移植到
 RM shared-JFS 路径。未取得该数据前，只把“CQE 频率是候选软件瓶颈”登记为源码分析，不宣称它是当前
 134 Gbps 的唯一根因。
+
+### 12.12 文件直接读取到 registered TX 的可行性（2026-09-10 源码复核）
+
+`[源码确认]` 当前 Parent TX source-fill 实际有两条路径：
+
+| source | 当前数据路径 | 用户态/内核数据搬运 |
+|---|---|---|
+| `mmapContent=true` | file page cache/mmap page → `copy_from_slice` → registered TX span | 一次 source-to-TX copy |
+| 默认 Reader/fallback | file → `RangeReader` 内部 `BytesMut` → `AsyncRead::read_exact(dst)` → registered TX span | file read 加一次 staging-to-TX copy |
+
+`PieceSource::Reader` 表面上调用 `reader.read_exact(dst)` 直接填 TX，但实际 `RangeReader::poll_fill_buf()`
+先在 blocking thread 中用 `FileExt::read_at()` 填自己的 pooled `BytesMut`，随后
+`AsyncRead::poll_read()` 通过 `ReadBuf::put_slice()` 再复制到 TX。因此“RangeReader direct-fill”只表示
+不再创建 Piece-sized owned Window，并不等于文件数据直接进入 registered TX。
+
+文件可以直接读入 registered TX；这不是 URMA/provider 限制。当前没有这样做主要是因为现有
+`Storage::upload_*` 返回通用 `RangeReader`，而普通文件 `read_at` 需要放到 blocking thread。
+`TxWindowLease::part_mut()` 返回的临时 `&mut [u8]` 不能直接跨入要求 `'static` 的
+`spawn_blocking`。安全实现需要把整个独占 `TxWindowLease` 连同 `Arc<File>`、file offset 一起移入
+blocking task，读取完成后再把 lease 交还发送路径；同时必须保证该 Window 没有 outstanding SEND，只有
+spare A/B Window 可以被 refill。
+
+候选实现应按 Window 读取，而不是固定每 64 KiB 发起一次 syscall：
+
+1. 从 Storage 获取 `Arc<File> + piece offset + length` 的 file-backed source；
+2. acquire/reshape 一个独占 `TxWindowLease`；
+3. 把 lease 移入 `spawn_blocking`；
+4. 对连续 Window 使用一次或少量 `pread`，对离散 spans 使用 `preadv`，处理 short read/EINTR/tail；
+5. 返回已填充 lease，再 post SEND；全部 SEND CQE 收敛后才允许 refill；
+6. cache-resident Piece、无法取得 file descriptor 或 direct-read 失败时继续回退 RangeReader。
+
+该方案的预期边界：
+
+- 相对 Reader/fallback，可以消除 `RangeReader BytesMut → registered TX` 的额外 copy；
+- 相对 mmap-copy，两者通常都只有一次 page-cache-to-TX 数据搬运；direct `pread/preadv` 多 syscall/
+  blocking-pool 调度，mmap-copy 可能有 page fault，因此谁更快必须实测；
+- direct read 不是零拷贝，不能替代第 7 章候选的 file-mmap Segment + URMA READ；
+- 一次 1 MiB Window 的 `pread/preadv` 通常比 16 次 64 KiB `pread` 更合理，避免把减少 copy 的收益
+  换成 syscall/调度开销。
+
+建议新增相同 B7 workload 的三路 A/B：`RangeReader`、`mmap-copy`、
+`window pread/preadv direct-fill`。除 E2E throughput 外，记录 `tx_fill_ns`、Parent CPU、context
+switch/syscall、major/minor fault、memory bandwidth，并分别测试 warm page cache 与 cold/受压状态。
+在无真机数据前，该项登记为“可实现且可能改善 Reader fallback 的候选优化”，不宣称会优于 mmap-copy。
