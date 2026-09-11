@@ -24,6 +24,9 @@
   每条 SEND WR 仍设置 `complete_enable=1`，因此 N 条成功 post 的 SEND 会产生 N 条 SEND CQE。上层虽只在
   整个 Window 的 CQE 全部退休后收到一次 Window completion，但这不等于 native 层已经使用 CQ moderation。
   TX selective completion/frontier retirement 尚未接入当前 RC/RM production path。
+- `[PR 清理阻塞项]` RC 阶段提交 `e012298 feat: testbench` 引入的 `transport-only` benchmark profile
+  已被 RM 分支继承。提交上游 PR 前必须按 12.13 节清单删除 benchmark-only 代码、feature/env 入口和
+  B7 active case，并检查最终 diff；B8 同 lane 并发、正常 URMA 路径及通用 timing/metrics 不属于该清理项。
 
 仍未闭环：完整 fault/outstanding shutdown 矩阵、SEND_IMM 反向 probe、多物理 Child 扩展，以及
 transport-only、owner/CQ、CPU/NUMA、CRC32/Storage 的分层 profile。
@@ -871,3 +874,67 @@ spare A/B Window 可以被 refill。
 `window pread/preadv direct-fill`。除 E2E throughput 外，记录 `tx_fill_ns`、Parent CPU、context
 switch/syscall、major/minor fault、memory bandwidth，并分别测试 warm page cache 与 cold/受压状态。
 在无真机数据前，该项登记为“可实现且可能改善 Reader fallback 的候选优化”，不宣称会优于 mmap-copy。
+
+### 12.13 RC transport-only testbench 资产与上游 PR 清理提醒（2026-09-10）
+
+`[来源确认]` RC 分支末期的 commit `e012298f0ae83c4511becad2bec41f506dc9e42b`
+（`feat: testbench`）加入了 Dragonfly 内嵌的 `transport-only` 性能 profile，随后随
+`urma-main → urma-rm-prototype` 演进被 RM 分支继承。它不是 Criterion bench 或独立 binary，而是通过
+validation-only Cargo feature 和环境变量改变正常 Piece 落盘路径。
+
+该 profile 的行为是：保留 persistent TCP control、Piece/Window、`SEND_IMM`、CQE、长度、Done 和
+registered RX lease recycle，但跳过 Child CRC32 与 `pwrite/pwritev`，并用预期 digest 完成 Piece
+metadata。其输出文件内容不是有效 correctness artifact，只用于把 transport/lease 成本与
+CRC32/Storage 成本分层。
+
+#### 当前代码资产
+
+| 位置 | benchmark-only 内容 | PR 前处理 |
+|---|---|---|
+| `dragonfly-client-storage/src/client/urma.rs` | `DF_URMA_PERFORMANCE_PROFILE`、`transport-only`、`transport_only_profile_enabled()` | 删除 |
+| `dragonfly-client-storage/src/lib.rs` | 正常 URMA finish 路径中的 profile 分支，以及 `download_piece_from_parent_finished_urma_transport_only()` | 删除 |
+| `dragonfly-client/Cargo.toml` | 顶层 `urma-test-failpoints` feature 转发 | 与 fault hook 一并评审；若无其他验证 hook 保留需求则删除 |
+| `dragonfly-client-storage/Cargo.toml` | storage `urma-test-failpoints` feature | 与上一项同步处理 |
+| `dragonfly-client-storage/src/client/urma.rs` | `DF_URMA_FAIL_AFTER_RECV_WINDOWS` 中途失败注入 | 不属于 benchmark 本体；上游 PR 是否接受 test failpoint 需单独决定 |
+
+不要把以下生产能力误删：
+
+- B8 同一 persistent Lane/Session 上的并发 Piece 和 `transfer_id` multiplexing；
+- normal URMA 的 registered RX Window、CRC32、`pwrite/pwritev` 和 metadata commit；
+- `tx_fill_ns`、`tx_send_wait_ns`、pool-acquire、owner/CQ 等通用观测字段；
+- correctness 单元测试、partial-post、credit、shutdown 和 lease 生命周期逻辑。
+
+#### 当前测试工具资产
+
+目录：`/home/yuan/workspace/dev/dragonfly-urma-tools/urma-b7`。
+
+| 文件 | 相关内容 | PR/收尾处理 |
+|---|---|---|
+| `cases.json` | `fanout-piece16-cc8-post1-in16-l8-tx128-transport-only-tmpfs` 及 CRC32+pwrite 对照 case | benchmark 结束后删除或移入明确的历史/私有 profile |
+| `b7.py` | `urmaPerformanceProfile`、环境变量导出、transport-only 特殊完整性与日志门禁 | 删除 transport-only 专用分支 |
+| `test_b7.py` | 上述 case/profile 的测试 | 随工具代码删除 |
+| `README.md` | “transport-only 与 CRC32+pwrite tmpfs 分层对照”执行说明 | 删除 active instructions，结果保留到历史台账 |
+
+#### 当前相关文档
+
+- `real-provider-validation-runbook.md`：validation feature 构建命令及 transport-only/CRC 对照；
+- `phase-b-performance-data-path.md`：transport-only 分层测试计划和当前状态；
+- 本台账 12.10 节：待执行的两组 tmpfs case；
+- `urma-stage-summary/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md`：
+  B7 适用边界及 transport-only 瓶颈定位说明。
+
+这些工程文档位于 Dragonfly 代码仓库之外，不会直接进入上游 PR。清理时不应删除已经取得的历史证据；
+应把未执行的 active instructions/case 标为取消或归档，并保留“为什么做过、测到了什么、为什么删除”
+的台账记录。
+
+#### 提交上游 PR 前的强制检查
+
+1. 删除上述 transport-only 生产仓代码及环境变量入口；
+2. 决定 `DF_URMA_FAIL_AFTER_RECV_WINDOWS` 是否也随 validation feature 删除，不能与 benchmark 清理混为一谈；
+3. 清理 B7 active case、runner 分支和测试，文档改成 historical/archived；
+4. 若保留 `urma-test-failpoints`，确认普通 `--features urma` 构建完全不含环境变量行为；若无保留项则删除整个 feature；
+5. 对上游基线执行 `git diff`/`rg`，确认不存在 `transport-only`、`DF_URMA_PERFORMANCE_PROFILE` 和
+   `download_piece_from_parent_finished_urma_transport_only`；
+6. `e012298` 已处于 RM 分支祖先历史中；不能只看工作区代码。PR 整理时使用 cleanup commit 后 squash，
+   或在安全 rebase 中 drop/fixup，使最终 PR 的净 diff 和提交历史都不再呈现临时 testbench；
+7. 清理后重新运行 normal URMA build/test，确认正常 CRC32/Storage 路径仍是唯一 Piece finish 路径。
