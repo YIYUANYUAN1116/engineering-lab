@@ -255,6 +255,57 @@ Child                                              Parent
 - RC bind 完成后，SEND 的远端目标由 Lane 隐含，不需要每个 WR 再显式选择 target。
 - TCP control connection 还承载 PieceRequest、PieceMetadata、RecvPosted、Done 和 Error 等控制帧。
 
+#### 3.2.1 RC 端到端主时序
+
+这张图只回答三个问题：谁选择 Parent、谁传控制消息、谁搬运 Piece 数据。Window、CQE 和双流水线细节见 2.2、2.3、3.3～3.5 节。
+
+```mermaid
+sequenceDiagram
+    participant D as dfget
+    participant CDF as Child dfdaemon
+    participant SCH as Scheduler
+    participant CS as Child Storage
+    participant CF as Child URMA Fabric
+    participant PDF as Parent dfdaemon
+    participant PF as Parent URMA Fabric
+    participant PS as Parent Storage
+
+    D->>CDF: 1. 发起下载任务
+    CDF->>SCH: 2. 请求 Piece 调度
+    SCH-->>CDF: 返回 Parent 地址
+
+    opt 首次连接该 Parent
+        CDF->>PDF: 3. TCP 协商 URMA 能力
+        CDF->>CF: 创建 RC Jetty/JFR，导出 descriptor
+        PDF->>PF: 创建 RC Jetty/JFR，导出 descriptor
+        CDF->>PDF: TCP：交换双方 Jetty descriptor
+        CDF->>CF: import Parent target + bind
+        PDF->>PF: import Child target + bind
+        Note over CF,PF: 建立可跨 Piece 复用的 RC Lane
+    end
+
+    CDF->>PDF: 4. TCP：请求 Piece
+    PDF->>PS: 读取 Piece 并准备 registered TX buffer
+    PDF-->>CDF: TCP：Piece Ready
+    CDF->>CF: 准备 registered RX buffer / post RECV
+    CDF->>PDF: TCP：RecvPosted
+
+    PDF->>PF: 5. SEND_IMM（目标由 bound Lane 决定）
+    rect rgb(225, 242, 255)
+        PF->>CF: URMA 搬运 Piece payload<br/>Parent TX → Child RX
+    end
+    PF-->>PDF: SEND complete
+    CF-->>CDF: RECV complete
+    PDF-->>CDF: TCP：Done
+    CDF->>CS: CRC32 + 写入并提交 Piece
+    CDF->>SCH: 6. 上报 Piece 完成
+    CDF-->>D: 返回下载结果
+```
+
+图中真正由 URMA 承担的工作只有蓝色数据段：把 Parent registered TX buffer 中的 Piece payload 通过 NIC 搬到 Child registered RX buffer。Scheduler 不进入数据路径；Parent/Child 间的 TCP 只负责能力协商、Piece 请求、接收就绪和完成通知，不承载这段 Piece payload。
+
+RC 的核心特点是“一个 Parent 对应一条 persistent bound Lane”。因此发送时不必在每条 WR 上重新选择远端，接收完成也可以先由 Lane 确定来源 Peer。
+
 ### 3.3 RC TX 流程
 
 Parent 发送一组 Window 时：
@@ -448,6 +499,54 @@ dfdaemon 首个 RM Peer 到来
 - 不执行 per-peer RC bind；
 - SEND 时必须显式传入 TargetHandle；
 - shared JFR 上的 RECV 在 post 时不绑定某个远端 Peer。
+
+#### 4.2.1 RM 端到端主时序
+
+RM 的上层流程与 RC 相同：Scheduler 选 Parent、TCP 传控制消息、Storage 提供和落盘 Piece。图中只突出 RM 如何复用 shared endpoint 搬运 payload；credit 和 completion 解复用细节见 4.4～4.6 节。
+
+```mermaid
+sequenceDiagram
+    participant D as dfget
+    participant CDF as Child dfdaemon
+    participant SCH as Scheduler
+    participant CS as Child Storage
+    participant CF as Child URMA Fabric
+    participant PDF as Parent dfdaemon
+    participant PF as Parent URMA Fabric
+    participant PS as Parent Storage
+
+    D->>CDF: 1. 发起下载任务
+    CDF->>SCH: 2. 请求 Piece 调度
+    SCH-->>CDF: 返回 Parent 地址
+
+    opt 首次连接该 Parent
+        CDF->>PDF: 3. TCP 协商能力并交换 shared descriptor
+        CDF->>CF: import Parent → PeerTarget
+        PDF->>PF: import Child → PeerTarget
+        Note over CF,PF: 两端复用进程级 RM endpoint
+    end
+
+    CDF->>PDF: 4. TCP：请求 Piece
+    PDF->>PS: 读取 Piece 并准备 registered TX buffer
+    PDF-->>CDF: TCP：Piece Ready
+    CDF->>CF: 准备 shared-JFR RX buffer / post RECV
+    CDF->>PDF: TCP：RecvPosted
+
+    PDF->>PF: 5. SEND_IMM（显式指定 Child TargetHandle）
+    rect rgb(225, 242, 255)
+        PF->>CF: URMA 搬运 Piece payload<br/>shared Parent TX → shared Child RX
+    end
+    PF-->>PDF: SEND complete
+    CF-->>CDF: RECV complete + 识别 Peer/Transfer
+    PDF-->>CDF: TCP：Done
+    CDF->>CS: CRC32 + 写入并提交 Piece
+    CDF->>SCH: 6. 上报 Piece 完成
+    CDF-->>D: 返回下载结果
+```
+
+URMA 在 RM 中仍只负责蓝色数据段；Scheduler 和 TCP 的职责没有变化。与 RC 不同的是，多 Peer 共用一套本地 endpoint/JFS/JFR/JFC：Parent 每次 SEND 都用 `TargetHandle` 明确选择 Child，Child 在 RECV completion 到达后再根据 `remote_id + SEND_IMM + user_ctx` 找到来源 Peer、Piece Chunk 和实际 RX buffer。
+
+一句话对比：**RC 用“每 Peer 一条绑定 Lane”隔离连接；RM 用“一个共享 endpoint + 每 Peer 一个 TargetHandle”减少本地 native 资源。** 两种模式都不会为每个 Piece 新建 TCP 或 URMA endpoint；发生 URMA 错误时，都必须丢弃部分 Piece 并回退普通 TCP Piece 下载。
 
 ### 4.3 RM TX 流程
 
