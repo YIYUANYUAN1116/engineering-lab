@@ -1,12 +1,26 @@
 # B7 真实 Provider 性能验证台账
 
-更新时间：2026-09-10。
+更新时间：2026-09-18。
 
 本文记录 Dragonfly URMA Phase B 在真实 provider、node1 parent / node2 child 环境中的性能实验。
 它只登记已经取得的实验数据、统计口径和由数据支持的结论；并发、多 peer、故障和 shutdown 结果在完成
 前不得从本台账中的单流结果外推。
 
 ## 0. 当前状态摘要
+
+- `[2026-09-18 RM/RC Piece CC sweep]` single-host Parent/Child 对照结果中，CC1～16 均为 RC 领先
+  2.8%～4.7%，CC32 时 RM+RTP 以 4502.6 MiB/s 反超 RC 1.4%；全矩阵最高点仍是 RC CC16 的
+  4595.2 MiB/s。测试机 4 GiB direct-I/O `dd` 顺序写约 3.5 GB/s、顺序读约 1.3 GB/s；详见第 14 节。
+  原始 manifest 和样本分布尚待回填，因此当前只登记趋势，不据此判定 RM 已整体优于 RC；
+- `[2026-09-18 RM transport/Storage 分层]` single-host RM+RTP、16 MiB Piece、CC16、tmpfs 下，
+  transport-only 在 TX48/RX48 与 TX64/RX96 两档预算分别达到 3077.88 和 3069.41 MiB/s；正常
+  CRC32+pwrite 分别为 1994.24 和 2127.67 MiB/s。扩大 registered budget 未改善 transport-only，
+  而两档预算中正常路径均显著慢于 transport-only；详见第 15 节。当前结果确认 Storage 消费路径是显著
+  成本，但尚不能把全部差值单独归因于 CRC32 或 pwrite；
+- `[2026-09-17 单机真实 provider]` 独立 `urma-transport-lab` RM/RTP READ probe 已通过：64 MiB
+  source 按 1 MiB 切为 64 条全部 signaled READ，64 条 CQE exact-once 路由、完整 SHA-256、drain 前
+  unimport `-EBUSY`、drain 后 unimport、source unregister/token release 和完整 shutdown 均成功；CQE
+  观测见第 13 节。该结果确认单机同 EID 基线，不替代跨节点、错误权限、revoke race 和 peer-exit 门禁；
 
 - B8 核心数据路径已完成：同一 persistent lane 的并发 Piece、64-bit `SEND_IMM` 路由、native RX
   window concurrency，以及 aggregate JFR/JFS admission 均已在目标方向通过真实 provider 正常路径；
@@ -938,3 +952,293 @@ CRC32/Storage 成本分层。
 6. `e012298` 已处于 RM 分支祖先历史中；不能只看工作区代码。PR 整理时使用 cleanup commit 后 squash，
    或在安全 rebase 中 drop/fixup，使最终 PR 的净 diff 和提交历史都不再呈现临时 testbench；
 7. 清理后重新运行 normal URMA build/test，确认正常 CRC32/Storage 路径仍是唯一 Piece finish 路径。
+
+## 13. RM/RTP READ 单机真实 Provider 基线（2026-09-17）
+
+### 13.1 环境与命令
+
+- 拓扑：同一物理 B7 host 上两个进程，经 `127.0.0.1:31912` 只交换 OOB descriptor/control；
+- URMA device：`udmac0d1e2`；
+- EID index：1；
+- transport：`URMA_TM_RM`，TP type 为 RTP；
+- source：64 MiB、4 KiB 对齐、pinned、non-cacheable、plain-token、remote READ-only Segment；
+- READ 切片：1 MiB，共 64 条；
+- JFS/owner window depth：128；
+- 每条 READ 均 `complete_enable=1`。
+
+命令：
+
+```bash
+./target/release/rm_read_probe \
+  parent udmac0d1e2 1 127.0.0.1:31912 \
+  67108864 1048576 128
+
+./target/release/rm_read_probe \
+  child udmac0d1e2 1 127.0.0.1:31912 \
+  67108864 1048576 128
+```
+
+首轮 parent 曾在 `urma_register_seg()` 返回 shim fallback `-5`。根因是 probe 将普通 Rust `Vec` 堆地址
+直接用于 UDMA Segment grant，而 `urma_perftest` 使用 page-aligned backing。改为 shim-owned 4 KiB 对齐
+allocation 后，相同命令通过。child 首轮的 OOB EOF 只是 parent 在发送 descriptor 前退出的连带错误。
+
+### 13.2 结果
+
+| 字段 | 观测值 |
+|---|---|
+| transfer bytes | 67,108,864 |
+| chunk bytes | 1,048,576 |
+| accepted/completed READ | 64 / 64 |
+| provider `max_read_size` | 268,435,456 |
+| outstanding owner 时 unimport | `-16` (`EBUSY`) |
+| CQE status | 全部 success |
+| CQE opcode set | `[0]` |
+| CQE completion length set | `[0]` |
+| CQE local ID set | `[1050]` |
+| `is_recv` | `false` |
+| `user_ctx_valid` | `true` |
+| `is_jetty` set | `[true]` |
+| `remote_id_valid` set | `[false]` |
+| `imm_data_valid` set | `[false]` |
+| full SHA-256 | passed |
+| exact-once owner retirement | passed |
+| drain 后 Segment/Jetty unimport | passed |
+| source unregister/token release | passed |
+| Jetty/JFC/JFCE/context/liburma shutdown | passed |
+
+parent 与 child 最终均输出 `state=passed` 和 `cleanShutdown=true`。
+
+### 13.3 该结果确认的契约
+
+1. 目标 provider 在单机同 EID、双进程条件下支持 RM/RTP Jetty + remote READ Segment + one-sided READ。
+2. READ completion 出现在 initiator send JFC，`is_recv=false`、`is_jetty=true`，且 `user_ctx` 可用于
+   exact-once owner 路由。
+3. 本 provider 的成功 READ CQE 中 `opcode=0`、`completion_len=0`。二者只登记为观测事实；不能用
+   `opcode` 识别 READ，也不能用 `completion_len` 证明传输长度。长度正确性由已接受 WR 元数据与完整内容
+   digest 建立。
+4. send-side READ CQE 的 `remote_id_valid=false`，`imm_data_valid=false`，符合这两个字段不能参与 READ
+   owner 路由的设计。
+5. wrapper 在 READ owner outstanding 时返回 `-EBUSY`，全部 CQE retirement 后才允许 unimport；这验证
+   了本地生命周期门禁。它不证明 provider 会自动 drain outstanding READ。
+6. parent 在 child 明确发送 drained/unimported acknowledgement 后才 unregister source、释放 token/backing，
+   成功路径 teardown 顺序通过。
+
+### 13.4 尚未由本轮确认
+
+- 跨物理节点 RM/RTP READ；
+- invalid token、越界或权限错误的 CQE/同步错误形态；
+- unregister/revoke 与 outstanding READ 的 provider 竞争语义；
+- revoke 后旧 descriptor/token、地址/token 重用；
+- peer crash、TCP 断开和 Jetty ERROR/flush；
+- partial-post accepted prefix；
+- Dragonfly production wire、Storage lease 和 TCP fallback 集成；
+- READ 相对现有 RM SEND/RECV 的 Dragonfly E2E 性能。
+
+因此 R1 的正常路径、CQE 路由和本地 owner/unimport 门禁已有真实 provider 证据；production READ 仍保持
+关闭，后续门禁不能从本轮单机正常路径外推。
+
+## 14. RM+RTP / RC Piece CC 对照与磁盘基线（2026-09-18）
+
+### 14.1 用户提供的结果
+
+以下为本轮提供的 mean throughput 对照，吞吐单位暂按 B7 既有口径登记为 MiB/s，待 manifest 确认。
+`差异` 使用同一 Piece CC 下较快模式相对较慢模式的比例；当前尚未收到 run ID、manifest、原始样本和
+标准差/分位数。
+
+已确认拓扑为同一物理机上的 single-host Parent/Child。结果对应 B7 的以下 case：
+
+```text
+urma-piece-16mib-cc1-post1-pipe2
+urma-piece-16mib-cc2-post1-pipe2
+urma-piece-16mib-cc4-post1-pipe2
+urma-piece-16mib-cc8-post1-pipe2
+urma-piece-16mib-cc16-post1-pipe2
+urma-piece-16mib-cc32-post1-pipe2
+```
+
+按当前 `urma-b7/cases.json`，共同配置为 1 GiB 文件、16 MiB Piece、URMA、`postListSize=1`、
+`pipelineDepth=2`、1 次 warmup 和 3 次 measured task。CC1～16 的 `maxInflightChunks=16`，CC32 的
+`maxInflightChunks=32`；因此 CC32 与前面各点不是只改变 Piece CC 的严格单变量 sweep。
+
+| Piece CC | RM+RTP mean (MiB/s) | RC mean (MiB/s) | 同 CC 差异 |
+|---:|---:|---:|---:|
+| 1 | 1734.0 | 1795.0 | RC +3.5% |
+| 2 | 2589.6 | 2698.6 | RC +4.2% |
+| 4 | 3298.8 | 3408.8 | RC +3.3% |
+| 8 | 4218.8 | 4335.4 | RC +2.8% |
+| 16 | 4390.6 | **4595.2** | RC +4.7% |
+| 32 | **4502.6** | 4440.1 | RM +1.4% |
+
+### 14.2 当前可支持的观察
+
+1. CC1～16 范围内 RC 稳定领先，幅度为 2.8%～4.7%；差距不大，但方向一致。
+2. CC32 时 RM+RTP 达到自身最高点 4502.6 MiB/s（约 37.77 Gbps），并比同 CC 的 RC 高 1.4%。
+3. RC 的矩阵最高点出现在 CC16，为 4595.2 MiB/s（约 38.55 Gbps）；CC32 降至 4440.1 MiB/s。
+4. 若比较两种模式各自的最高点，RC CC16 仍比 RM CC32 高约 2.1%。因此本轮只能说明 RM 在更高 Piece
+   并发下保持扩展并在 CC32 同点反超，不能表述为 RM 整体吞吐已经超过 RC。
+5. 同一 CC 下 RM/RC 使用对应的同名 case，模式横向差异仍有参考价值；但 CC16→CC32 同时改变了
+   `concurrentPieceCount` 和 `maxInflightChunks`，该段曲线不能把变化全部归因于 Piece 并发。
+
+### 14.3 测试机磁盘参考值
+
+测试目录位于 controller 的 `/home/y30083740/dragonfly-b7`。写测试使用 4 GiB 文件、1 MiB block 和
+`oflag=direct`：
+
+```bash
+dd if=/dev/zero \
+  of=/home/y30083740/dragonfly-b7/disk-test.bin \
+  bs=1M count=4096 \
+  oflag=direct status=progress
+```
+
+最终输出：
+
+```text
+输入了 4096+0 块记录
+输出了 4096+0 块记录
+4294967296 字节 (4.3 GB, 4.0 GiB) 已复制，1.20986 s，3.5 GB/s
+```
+
+读测试对同一文件使用 `iflag=direct`：
+
+```bash
+dd if=/home/y30083740/dragonfly-b7/disk-test.bin \
+  of=/dev/null \
+  bs=1M \
+  iflag=direct status=progress
+```
+
+最终输出：
+
+```text
+输入了 4096+0 块记录
+输出了 4096+0 块记录
+4294967296 字节 (4.3 GB, 4.0 GiB) 已复制，3.33543 s，1.3 GB/s
+```
+
+汇总：
+
+| 项目 | 观测值 |
+|---|---:|
+| 顺序写 | 约 3.5 GB/s |
+| 顺序读 | 约 1.3 GB/s |
+
+两条命令分别使用 direct write 和 direct read，降低了 page cache 对 `dd` 本身的影响；但该数据仍不能
+直接作为本轮 B7 E2E 的上下限：
+
+- 本轮最高 E2E 已达到约 4.4 GiB/s，明显高于 `dd` 顺序读 1.3 GB/s，说明 Parent source 很可能受
+  page cache、预热状态或不同 I/O 路径影响，而不是每轮都从裸盘顺序读取；
+- buffered write、page cache、文件系统和异步回写可能让 dfget wall time 中观测到的写入速率高于裸盘
+  持续落盘速度；
+- `GB/s` 与 B7 的 `MiB/s` 口径不同；`dd` 测的是 controller 上该文件系统的持续 direct I/O，B7 测的
+  是带预热、page cache、网络传输、CRC32 和 Storage 写入的完整应用路径，两者只能辅助定位，不能直接
+  相减或据此计算 URMA transport 开销。
+
+### 14.4 待回填证据
+
+正式引用或用于 RC/RM 方案选择前，至少回填：
+
+- RM、RC 的 commit/binary hash、配置 hash、UMDK/provider/firmware 版本和 RTP/CTP 参数；
+- B7 run ID、manifest、每个点的原始样本和 p50/p95；
+- CPU/NUMA 绑定、TX/RX budget 和其他未由 case 文件固定的运行时参数；
+- 每个 case 是否完全通过内容校验、URMA 日志门禁，且不存在 TCP fallback；
+- 文件系统、块设备/RAID/挂载参数，以及 B7 Parent source 和 Child output 的实际缓存/回写状态。
+
+## 15. RM transport-only 与 CRC32+pwrite 分层结果（2026-09-18）
+
+### 15.1 目的与共同条件
+
+本轮用于区分 RM SEND/RECV transport/lease 路径与 Child Storage 消费路径。共同条件：
+
+| 维度 | 配置 |
+|---|---|
+| 拓扑 | single-host Parent/Child |
+| transport | RM + RTP，process-wide shared endpoint + PeerTarget |
+| 文件 / Piece | 1 GiB / 16 MiB，共 64 Piece |
+| Piece CC / MCT | 16 / 16 |
+| Chunk / Window | 64 KiB / in16，单 Window 约 1 MiB |
+| post / pipeline | post1 / pipe2 |
+| Storage | tmpfs |
+| warmup / measured | manifest 实际值为 1 / 3 |
+
+`transport-only` 仍执行 TCP control、RM SEND_IMM、CQE、长度/Done 门禁和 RX lease recycle，只跳过
+Child CRC32 与 pwrite；其 Child 文件内容无效，不能用于 SHA 完整性结论。正常路径执行 CRC32、pwritev、
+Piece metadata commit 和完整内容校验。
+
+新增 case 的开发侧定义目标曾是 `1 warmup + 5 measured`，但本轮四份 manifest 均明确记录
+`repetitions=3`，且每组 `parentUrmaFinished=256 = (1+3)×64`。因此本节严格按实际的 3 个 measured
+样本登记，不能按 5 个样本解释。
+
+### 15.2 Case 与 E2E 结果
+
+| run ID | 路径 | TX / RX budget | aggregate MiB/s | mean MiB/s | min / median / max MiB/s |
+|---|---|---:|---:|---:|---:|
+| `rm-layer-base-transport-001` | transport-only | 48 / 48 MiB | **3077.88** | 3088.18 | 2845.45 / 3165.43 / 3253.67 |
+| `rm-layer-base-transport-crc32-pwrite-001` | CRC32+pwrite | 48 / 48 MiB | 1994.24 | 1994.75 | 1960.93 / 1985.60 / 2037.74 |
+| `rm-layer-base-transport-002` | transport-only | 64 / 96 MiB | **3069.41** | 3079.41 | 2871.34 / 3065.21 / 3301.68 |
+| `rm-layer-base-transport-crc32-pwrite-002` | CRC32+pwrite | 64 / 96 MiB | 2127.67 | 2128.68 | 2068.58 / 2136.15 / 2181.32 |
+
+同预算配对结果：
+
+| 预算 | transport-only 相对 normal 吞吐 | normal 相对 transport-only 的 E2E 额外时间 |
+|---|---:|---:|
+| TX48 / RX48 MiB | +54.34% | +180.78 ms/GiB |
+| TX64 / RX96 MiB | +44.26% | +147.66 ms/GiB |
+
+这里的差值是完整 Storage 消费路径差值，包含 CRC32、tmpfs pwritev、RX lease 持有/释放、metadata commit
+以及由消费速度变化引起的流水线行为，不能全部记为 CRC32 算力成本。
+
+### 15.3 E2E 时间分解
+
+| 预算 / 路径 | start→first Piece ms | first→last Piece ms | tail ms | E2E mean ms |
+|---|---:|---:|---:|---:|
+| TX48/RX48 transport-only | 253.49 | **57.58** | 21.63 | 332.70 |
+| TX48/RX48 CRC32+pwrite | 296.71 | 196.34 | 20.43 | 513.48 |
+| TX64/RX96 transport-only | 256.46 | **55.47** | 21.69 | 333.61 |
+| TX64/RX96 CRC32+pwrite | 275.73 | 182.84 | 22.71 | 481.28 |
+
+最稳定的方向性差异位于 steady Piece completion 区间：基础预算 normal 比 transport-only 多
+138.76 ms，宽预算多 127.37 ms。按 first→last 之间约 63 个 Piece、1008 MiB 粗略换算：
+
+| 预算 | transport-only Piece-span rate | CRC32+pwrite Piece-span rate |
+|---|---:|---:|
+| TX48/RX48 | 约 146.9 Gbps | 约 43.1 Gbps |
+| TX64/RX96 | 约 152.5 Gbps | 约 46.2 Gbps |
+
+该换算只用于分层定位，不是完整任务吞吐，也不是裸 NIC 线速。
+
+### 15.4 Pressure 与正确性门禁
+
+| 预算 / 路径 | TX optional pressure | RX optional pressure / window1 fallback | RX buffer unavailable | required TX/RX wait |
+|---|---:|---:|---:|---:|
+| TX48/RX48 transport-only | 122 | 1423 / 1423 | 3 | 0 |
+| TX48/RX48 CRC32+pwrite | 109 | 178 / 178 | 0 | 0 |
+| TX64/RX96 transport-only | 95 | 1213 / 1213 | 5 | 0 |
+| TX64/RX96 CRC32+pwrite | 90 | 183 / 183 | 0 | 0 |
+
+四组均为：
+
+- `state=passed`，256 个 Parent upload、256 个 Child attempt/success；
+- `fallbackErrors=0`、`transferErrors=0`；
+- `tcpFallbackLines=0`、`sessionRetirementLines=0`、`previousTransferFailureLines=0`；
+- required TX/RX pressure 和 process admission wait 为 0；
+- shutdown 仅有预期 control queue close，`unexpectedErrors=0`；
+- 每组首次建连一次，后续 255 个 Piece 均复用 session。
+
+transport-only 会更快地推进并发 Transfer，因此更频繁尝试申请 optional RX Window；大量 window1 fallback
+不等于 required capacity 不足。TX48/RX48 扩到 TX64/RX96 后，transport-only optional RX fallback 下降
+约 14.8%，但 aggregate throughput 从 3077.88 变为 3069.41 MiB/s（-0.28%）。这组数据不支持把
+registered budget 或第二 RX Window 可用率认定为 transport-only 的首要吞吐瓶颈。
+
+### 15.5 当前结论与边界
+
+1. 两档预算下 normal 都显著慢于 transport-only，且差异主要集中在 first→last Piece，因此
+   CRC32+pwrite/Storage 消费路径是当前 RM E2E 的显著成本。
+2. 扩大 registered budget 对 transport-only 无收益；当前不继续沿“单纯增大 TX/RX pool”方向优化。
+3. normal 在宽预算下比基础预算高 6.69%，但其 RX optional fallback 没有下降，且尚未执行反向顺序复测；
+   该 6.69% 暂不能归因为注册预算收益。
+4. transport-only 三样本极差约 14%～15%，normal 约 4%～6%；transport 路径对运行时状态的敏感度更高，
+   需要反向顺序和更多 measured 样本后再固化精确收益比例。
+5. 下一步优先从 Child 日志汇总 `digest_ns`、`pwrite_ns`、`storage_total_ns`；然后运行 pipe1/pipe2 对照，
+   判断大量 optional window fallback 是否实际影响吞吐。若日志仍不足，再增加“transport + CRC、跳过
+   pwrite”的中间 validation profile。

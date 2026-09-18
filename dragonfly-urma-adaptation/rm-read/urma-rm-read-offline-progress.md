@@ -1,6 +1,6 @@
 # RM READ 离线实现进度
 
-更新时间：2026-09-16。
+更新时间：2026-09-17。
 
 设计入口：[RM READ 整体方案与路线图](./dragonfly-urma-rm-read-design-and-roadmap.md)。
 
@@ -287,6 +287,307 @@ env LD_LIBRARY_PATH=/home/yuan/workspace/cloud-native/umdk/build-urma/lib/urma/c
 - R0/R1 真机 capability、撤权/重用/授权边界验证；
 - 通过门禁后再接 file mmap、三类 Piece Storage 和性能验证。
 
+## 单机 RM 测试方法（2026-09-17，待上机执行）
+
+单机测试应分为 provider loopback 和 Dragonfly 双进程两个层次。两者都在同一台机器运行，但
+结论不同：前者只证明 UMDK/provider 的 RM 本地回环，后者才观察 Dragonfly 配置、Jetty import、
+控制面和数据路径。当前 `urma-read-prototype` 的 READ dispatch 仍关闭；要测已有 RM SEND/RECV，
+使用工具固定的 `urma-rm-prototype` checkout。
+
+### B7 测试目录约定
+
+B7 inventory 的单机默认目录已统一为：
+
+```text
+/home/y30083740/dragonfly-b7/origin   # seed 与每轮 origin hard link
+/home/y30083740/dragonfly-b7/storage  # parent/child storage 与 output
+/home/y30083740/dragonfly-b7/run      # 配置、socket、pid、daemon/dfget 日志与磁盘快照
+```
+
+`storageClass=tmpfs` 的 case 也使用上述 `storage` 根目录；运行前需要把该根目录（或其挂载点）
+挂载为 tmpfs，prepare 会检查文件系统类型。旧 manifest 中的 `/dev/shm/dragonfly-b7` 仍可按兼容
+规则清理，但新 run 不会再生成该路径。
+
+`origin.directory` 是文件系统路径；`origin.baseUrl` 仍为 `http://141.61.17.196:8080`，因此
+目标机上的 HTTP origin 服务必须把上述 `origin` 目录作为 document root（B7 不会修改 nginx 或
+其他 HTTP 服务配置）。若服务仍提供 `/var/www/dragonfly`，prepare 会生成无法下载的 URL，需先
+调整服务 document root 或本地 inventory。B7 的路径安全检查、磁盘快照和 cleanup 均从 inventory
+读取这三个根目录，并保留旧根目录仅用于回收历史 manifest。
+
+本次离线检查：`python3 -m unittest -v test_b7.py` 共 99 项通过；`b7.py plan --profile rm
+--mode single` 已确认 seed、run、storage 和日志均落在上述目录。没有执行真实 provider 或
+Dragonfly 进程。
+
+### A. 先做只读环境检查
+
+在目标机器上确认 device、EID index、URMA 工具和库：
+
+```bash
+command -v urma_admin urma_perftest
+urma_admin show --all
+urma_admin show topo
+ldconfig -p | grep -E 'liburma(_common)?'
+```
+
+`--server-address` 必须填 `eidIndex` 对应的 URMA EID，不能填 SSH 管理 IP。当前 B7 inventory
+默认使用 `device=udmac0d1e2`、`eidIndex=1`；如果本机实际值不同，先修改一份本地 inventory，
+不要直接套用旧的 `90.91.177.158`。保留上述命令原始输出和 `uname -a`、`sha256sum $(command -v urma_perftest)`。
+
+### B. RM provider 同机回环
+
+推荐用 B7 自动归档；它会在同一节点通过两个 SSH 会话启动 server/client，默认依次覆盖 RTP 和 CTP：
+
+```bash
+cd /home/yuan/workspace/dev/dragonfly-urma-tools/urma-b7
+python3 b7.py probe-provider --profile rm --mode single --host node1 \
+  --server-address <本机URMA-EID> --size 4096 --iterations 1000 \
+  --run-id rm-loopback-20260917
+python3 b7.py probe-provider --profile rm --mode single --host node1 \
+  --server-address <本机URMA-EID> --size 4096 --iterations 1000 \
+  --run-id rm-loopback-20260917 --execute
+cat results/rm-loopback-20260917/provider-probe.json
+```
+
+如果不使用 B7，在同机两个终端分别执行等价命令。server 不带 `-S`，client 带本机 EID：
+
+```bash
+# terminal 1
+urma_perftest send_bw -d udmac0d1e2 --eid_idx 1 --tp_aware --ctp \
+  -p 0 -j true -n 1000 -s 4096
+# terminal 2
+urma_perftest send_bw -d udmac0d1e2 --eid_idx 1 --tp_aware --ctp \
+  -p 0 -j true -n 1000 -s 4096 -S <本机URMA-EID>
+```
+
+去掉 `--ctp` 可单独测 RM+RTP；不要添加 `-O`，除非需要复现旧 priority。`--ctp` 的 provider
+probe 上限是 4096 bytes，RTP 可再测 65536；8 KiB/64 KiB 结果不能反推 CTP 的能力。
+记录每个 TP 的 return code、completion status、耗时和 `urma_admin show --all/topo` 快照。
+
+### C. Dragonfly 单机双实例
+
+先 dry-run 检查端口和路径，再执行；单机模式会在同一节点规划 parent/child 两套端口（默认
+44000/44008 与 44100/44108）、socket、storage 和 origin link：
+
+```bash
+cd /home/yuan/workspace/dev/dragonfly-urma-tools/urma-b7
+python3 b7.py plan --profile rm --mode single --host node1 \
+  --run-id rm-dragonfly-single-20260917
+python3 b7.py prepare --profile rm --mode single --host node1 \
+  --run-id rm-dragonfly-single-20260917 --case smoke-post1-pipe1 --execute
+python3 b7.py run --manifest results/rm-dragonfly-single-20260917/manifest.json --execute
+python3 b7.py cleanup --manifest results/rm-dragonfly-single-20260917/manifest.json --execute
+```
+
+执行前必须确认 inventory 中 parent/child YAML、`urma-rm-prototype` release `dfdaemon/dfget`、
+scheduler/origin 已在目标机存在；当前记录的 `/home/y30083740/dragonfly/config` 曾缺失，缺失时
+先恢复配置再运行。`prepare/run/cleanup --execute` 会创建、启动和删除本轮隔离资源，必须使用新
+run ID，不能覆盖未完成 manifest。
+
+### D. 如何判定结果
+
+provider JSON 中 RTP/CTP 两个 case 都是 `passed`，只表示同机 RM provider loopback 通过。Dragonfly
+还要检查 `evidence`、parent/child transfer log 和 manifest：
+
+```bash
+rg -n 'URMA|RM|fallback|import_jetty|early eof|Piece|error' \
+  results/rm-dragonfly-single-20260917/evidence \
+  /home/y30083740/dragonfly-b7/run/rm-dragonfly-single-20260917/{parent,child}/*.log
+sha256sum /home/y30083740/dragonfly-b7/storage/rm-dragonfly-single-20260917/{parent,child}/output.bin
+```
+
+必须区分三种结果：
+
+1. `provider passed`：同机 UMDK RM provider 成功；
+2. `Dragonfly RM passed`：日志和指标显示正常 URMA RM Piece/transfer，且内容校验通过；
+3. `TCP fallback/unsupported`：例如 `import_jetty=-1`、`early eof` 或明确 fallback，内容成功也
+   只能记为 fallback，不能记 RM PASS。当前已知单机 Dragonfly RM 曾在 `import_jetty` 后回退 TCP，
+   所以 B/C 两层结果必须分别归档。
+
+单机成功不能替代跨节点 provider/RM 验证，也不能证明 READ、撤权、token 重用或跨节点 EID 路由。
+真机结果应保存到 `results/<run-id>/provider-probe.json`、manifest 和 evidence，再回填 provider ledger。
+
 以上生产集成均未由当前八批基础代码完成；本地编译、纯状态或 provider-call 替身测试不计为真实
 provider 验证。下一步优先接真实 READ command/completion 路由，并补齐 owner loop 调度及控制面状态机，
 继续保持 production READ dispatch 关闭，直到 R0/R1 门禁具备证据。
+
+## 第九批：真实 CQE 路由与 owner loop 轮询接口（2026-09-17）
+
+`urma-transport-lab` 单机真实 provider probe 已通过 64 MiB / 1 MiB 分片的 RM/RTP READ：Child
+收到 64 个 send-side Jetty CQE，`user_ctx_valid=true`，内容校验、owner retirement、BUSY
+unimport 和 clean shutdown 均通过。该 provider 的成功 READ CQE 为 `opcode=0`、
+`completion_len=0`，且 `remote_id`、`imm_data` 无效。因此 Dragonfly 路由不使用 opcode、
+completion length 或 remote identity 判别 READ。
+
+本批实现：
+
+- READ `user_ctx` 使用独立前缀 `[0xffff][0xff][0x52][sequence:32]`。`0x52` 位于现有
+  `WrToken.operation` 字段且不是 SEND/RECV 的 1/2，未知或迟到的 READ CQE 不会误解码为现有 WR；
+- `ReadOwners` 在 native post 返回后建立 `context -> owner/jetty/request_length` 路由。
+  provider 返回 uncertain、可能已经接受的 WR 同样保留路由并隔离 owner，等待真实 CQE；
+- READ CQE 只接受 work-request event、send JFC、`user_ctx_valid=true`、`is_recv=false`、
+  `is_jetty=true` 和匹配的 local Jetty。请求长度取 post 时保存的 route；status 决定成功或失败；
+- wrong queue、wrong Jetty、未知或重复 context 都 fail closed。能够精确匹配的 error CQE 会退休
+  native WR、归还 WR credit，并把 transfer 保持在失败状态；
+- `CompletionRouter::poll_once_with_read` 在仅有 READ outstanding 时也轮询 send JFC，并在普通
+  SEND/RECV `WrToken` 解码前调用 READ sink；receive JFC 也经过 READ sink 以拒绝错误队列 CQE；
+- shutdown/drained 判定同时要求 READ route 表为空，避免 registry 已清空但 CQE ownership 仍悬空。
+
+验证：`cargo fmt --all`、`git diff --check` 通过；使用本地 UMDK 执行
+`cargo test --offline -p dragonfly-client-storage --features urma --lib urma::`，169 passed / 0 failed。
+新增测试覆盖真实 provider 的 opcode/length 形态、重复 CQE、错误队列/Jetty 隔离，以及 uncertain
+post 在 error CQE 到达前持续持有 route 和 WR。
+
+当前仍未发布 production READ capability，也没有 READ fabric command、Runtime 内的具体
+`ReadOwners` 实例或 Storage lease。下一步需要统一生产 `UrmaJetty` 与 native READ owner 当前使用的
+Jetty handle 所有权形态，把具体 READ owner 容器放入 fabric owner thread，再让其调用本批的
+`poll_once_with_read`；随后接 peer generation、shutdown/flush 和公平 post 调度。
+
+## 第十批：生产 Runtime owner 容器与原生依赖共享（2026-09-17）
+
+本批把第九批的 READ-aware completion 接口接入生产 `UrmaRuntime` 和 fabric owner loop，但仍不开放
+READ capability、配置或 fabric command：
+
+- 生产 shared RM Jetty 的 native handle 改为 owner-thread 内的 `Rc<RefCell<JettyHandle>>`；普通
+  SEND/RECV 和 READ 使用同一个 Jetty/JFS，不再为 READ 建第二套 endpoint；
+- `PeerTarget` 的 imported target 改为 `Rc<TargetHandle>`。未来 Child READ owner 可同时持有 Jetty
+  和 target，PeerTarget close 在引用未释放时 fail closed，防止 target unimport 和 peer ID generation
+  重用早于 READ import/WR 退休；
+- Jetty close 同样检查 READ 引用；只要 Child owner 仍持有 Jetty，endpoint、JFC 和 native runtime
+  就不能继续关闭；
+- `UrmaRuntime` 新增具体类型
+  `ReadOwners<(), CreditedChild<NativeChild<()>>>` 的 disabled/active owner-thread 状态。当前启动固定为
+  disabled，尚无协商或配置能切到 active；
+- `UrmaRuntime::poll_once` 现在始终调用 `poll_once_with_read`，`outstanding()` 同时统计普通 WR 和 READ
+  route。fabric owner loop 因此会在只有 READ outstanding 时继续 poll send JFC；
+- peer 创建/retire 已接 READ generation registry；peer reap 要求该 generation 的 READ entries 清空；
+- shutdown 先停止 READ admission，再把 READ outstanding/drained 纳入普通 drain、endpoint flush、超时
+  报错和最终资源关闭门禁。未完成 READ cleanup 时不会关闭 target、Jetty、JFC 或 native runtime。
+
+新增无 provider 的生命周期测试，验证 READ clone 会阻止 target/Jetty close，释放 clone 后可以重试
+关闭。使用本地 UMDK 执行 storage URMA lib 测试：170 passed / 0 failed；`cargo fmt --all -- --check`
+和 `git diff --check` 通过。完整非 lib `cargo check` 仍被现有 `dragonfly-api` build script 向只读 Cargo
+dependency source 写 `src/descriptor.bin` 阻断，与本批代码无关。
+
+当前 active variant 只确定生产所有权和调度位置，没有创建入口。下一步应加入显式、默认关闭的 READ
+runtime 配置和统一 JFS admission，使 SEND 与 READ 共享真实 send depth；然后实现 owner-thread Child
+create/post/retire command，使用本批提供的 shared Jetty/target，并继续保持 wire capability 不发布。
+
+## 第十一批：READ-only JFS admission 与 Child owner command（2026-09-17）
+
+本批按用户确认将该分支定义为 READ-only bulk data 分支，不再要求保留 SEND/RECV 数据面兼容。实现
+选择相应调整为独占而非共享：
+
+- 新增显式 `ReadRuntimeConfig`，包含统一 source/destination byte budget、per-peer READ outstanding
+  上限和 destination buffer alignment。配置参与 process-shared Fabric identity，配置不一致不能复用
+  同一个 native runtime；
+- READ-only 启用时，effective JFS depth 不再受旧 TX slot 数量约束，完整分配给
+  `ReadWrCredits`；per-peer limit 不能超过实际 JFS depth；
+- READ-only runtime 明确拒绝旧的 receive-window、send-credit 和 registered SEND command，避免两套
+  WR 记账同时使用同一个 JFS。旧接口暂时保留在源码中供后续删除，但不属于 READ-only active path；
+- startup gate 要求 provider `max_read_size > 0`，READ buffer alignment 必须是至少 4096 的二次幂，
+  byte budget 继续由统一 `ReadOwners` 验证；
+- fabric owner thread 新增 `CreateReadChild`、`PostReadChild` 和 cleanup-only `RetireReadChild` command。
+  Create 在 owner thread 内完成 destination byte reservation、buffer allocation、remote Segment import、
+  shared Jetty/PeerTarget retention 和 JFS credit绑定；
+- Create 的 descriptor/token authentication 与 transfer generation 证明仍由未来 wire/session 状态机提供，
+  因而 facade 保持显式 `unsafe`；quarantined create 会把 owner ID 返回给调用者，不能因错误丢失 cleanup
+  身份；
+- Post 返回 provider `user_ctx` 并立即进入第九批建立的 CQE route。Retire 当前只用于失败、取消和
+  shutdown cleanup；成功数据尚未形成 Storage lease，不能调用该接口冒充业务完成。
+
+验证新增 READ-only 配置测试：旧模式 send depth 受 TX slots 约束，READ-only 模式取得完整 provider JFS
+depth，且 READ 配置会改变 shared Fabric identity。使用本地 UMDK 执行 storage URMA lib 测试：
+171 passed / 0 failed；`cargo fmt --all -- --check`、`git diff --check` 通过。
+
+当前 server/client 配置适配层尚未构造 `ReadRuntimeConfig`，所以线上启动仍不会进入 active READ-only
+状态；wire capability 也仍未发布。下一步是实现 Parent source register/descriptor/revoke owner commands，
+随后定义 DFUR READ Offer/BufferReady/ReadDone/Done 状态机，把 Child create/post 与 Parent grant 串起来。
+
+补充：READ-only startup 不再创建旧 registered TX/RX slot pool，避免在 Piece-sized READ destination/source
+预算之外重复 pin SEND/RECV 内存。READ owner loop 使用不依赖 `UrmaBufferPool` 的 send-JFC poll；除
+READ CQE和 endpoint lifecycle CQE 外，任何普通 WR CQE都作为 READ-only 协议错误处理。duplex Jetty、
+send/recv JFC/JFR 对象仍按已验证 provider 约束创建，但不会 post legacy SEND/RECV WR。
+
+## 第十二批：Parent source owner-loop 生命周期（2026-09-17）
+
+本批把已经离线验证的 Parent `ReadSource` owner 接入 `UrmaRuntime` 与 fabric owner command 队列，但仍未
+接入 DFUR wire/session，也未开启生产 READ：
+
+- 新增 `ReadSourceRequest`、opaque `ReadSourceId`、`ReadSourceOffer` 和 admission 结果；source 注册、
+  descriptor 导出和 token 交付都在唯一 native owner thread 串行完成；
+- 注册成功但 descriptor 导出失败时，不释放 source/backing，而是先停止该 owner 的正常 dispatch，保留
+  id、完整预算和 native ownership 供后续清理；已知未开始注册的 rejection 才允许立即释放 backing；
+- 新增 `RegisterReadSource`、`RetireReadSource`、`UnregisterReadSource`、
+  `ReleaseReadSourceAfterRevoke` fabric commands，并将清理命令放入 urgent queue；
+- 清理保持三阶段边界：`retire` 只停止 descriptor 使用；`unregister` 需要 provider drain permit 且仍保留
+  backing/预算；只有独立证明旧 generation/token 的远端访问已经终止且不能恢复后，才允许 release；
+- `ReadDone`、TCP EOF 和 timeout 本身仍不能构造 unregister/revocation proof。wire 状态机必须先完成
+  Child accepted WR drain + unimport，再由 Parent 的 provider 撤权门禁提供独立证明；
+- unsafe facade 明确承担 exact Piece immutable backing、peer/transfer generation 认证和 provider proof；
+  command handler 本身不能绕过这些入口构造证明。
+
+验证：`cargo test --offline -p dragonfly-client-storage --features urma --lib urma::` 在修正本机 UMDK
+`liburma_common` 搜索目录后通过，171 passed、0 failed；`cargo fmt --all` 与 `git diff --check` 通过。
+
+下一步：定义 READ-only DFUR capability 和 `BufferReady/SegmentOffer/ReadDone/Done`、
+`Cancel/CancelDrained/Cancelled` 的 pointer-free wire DTO，先实现纯状态机与 generation/tombstone 测试，
+再把本批 Parent command 和上一批 Child command 接入 session。
+
+## 第十三批：READ-only DFUR wire DTO 与纯状态机（2026-09-17）
+
+本批新增独立 `read_protocol`，仍未挂入现有生产 listener/session：
+
+- 定义 DFUR READ wire version 5；READ frame 使用独立 envelope codec，version 4 会 fail closed，不会被
+  READ peer 当作兼容的 SEND/RECV 协议；
+- 定义 READ capability：`max_read_size`、`max_jfs_sge`、`descriptor_version`，协商后的 READ 上限取双方
+  `max_read_size` 最小值，零值和 descriptor version 不匹配直接拒绝；
+- 定义 pointer-free `BufferReady`、`SegmentOffer`、`ReadDone`、`Done`、`Cancel`、
+  `CancelDrained`、`Cancelled` DTO；SegmentOffer 显式携带 descriptor 字段、token、非零
+  `segment_generation` 和 `effective_max_read_size`，自定义 Debug 不输出 token；
+- 所有 frame 使用 `peer_generation + transfer_id + metadata_generation` 的完整基础身份；Offer 后的 frame
+  还必须匹配非零 `segment_generation`，不存在用零 generation 匹配已发布 export 的路径；
+- Parent 状态机强制 `BufferReady -> register/publish Offer -> ReadDone -> revoke -> Done`；Done 只能在
+  source 安全释放后产生。Offer 后取消必须等待同 generation 的 `CancelDrained`，且 accepted/retired WR
+  计数完全相等后才能进入 revoke；
+- Child 状态机覆盖正常 READ、Offer 前取消、Offer 后取消和迟到 Offer。Cancel 后迟到 Offer 只产生
+  `DrainLateOffer`，不能进入 `StartRead`；关闭 import 并退休全部 accepted WR 后才能发 CancelDrained；
+- 增加有界 tombstone，按完整 transfer identity 和可选 segment generation 去重 terminal；容量淘汰后的
+  古老重复 frame 回到 unknown/fail-closed 路径，不会无限增长。
+
+新增 9 个定向测试覆盖 DTO round-trip、token 日志脱敏、READ version gate、capability 协商、正常生命周期、
+Offer 前/后取消、迟到 Offer、错误 generation/长度/WR 计数以及 tombstone 边界。完整 URMA 测试结果：
+180 passed、0 failed；`cargo fmt --all` 与 `git diff --check` 通过。
+
+下一步：把 READ capability 和 version 5 握手接入 rendezvous，建立 READ 专用 lane control dispatcher，随后
+用 adapter 把 Parent/Child 状态机 action 映射到上一批 owner-loop command。接线阶段仍保持 feature/config
+gate，直到单机真实 session 跑通后再替换当前生产 SEND/RECV session。
+
+## 第十四批：version 5 lane handshake 与 READ dispatcher（2026-09-17）
+
+本批在 `read_control` 中接通 version 5 DFUR envelope 的 lane handshake 和 transfer dispatcher，仍由独立
+模块承载，尚未替换生产 client/server session：
+
+- 新增 READ lane capability，固定 READ 数据面并协商 transport type、RTP/CTP、fabric tag、
+  `max_read_size`、`max_jfs_sge` 和 descriptor version；兼容检查返回双方较小的有效 READ 长度；
+- 新增 `Connect/Connected` version 5 handshake，双方交换 capability、Jetty descriptor，并要求 server
+  原样回显非零 `session_generation`；descriptor 空值、超长、capability 不匹配或错误 generation 均拒绝；
+- wire identity 从两端无法共享的本地 `PeerTarget generation` 调整为握手协商的 64-bit
+  `session_generation`。两端本地 PeerTarget generation 继续由 runtime owner 使用，session adapter 后续
+  显式绑定二者，不能假设两端本地 generation 数值相同；
+- 增加不回绕的 process-level session generation allocator；耗尽时停止 admission，而不是复用旧 identity；
+- `ReadLaneControl` 使用单 reader/single writer task，在一个 lane 内按完整
+  `session_generation + transfer_id + metadata_generation` 路由多个 Piece；注册受 semaphore 上限约束；
+- send 和 receive 两侧都验证完整 identity。错误 session generation、同 transfer 不同 metadata
+  generation、未知 transfer 都会关闭 lane，不能路由到相邻 Piece；
+- 正常 finish 和非正常 drop 都写入有界 tombstone；匹配的重复 `Done/Cancelled` 被吸收，不影响 sibling
+  transfer。已退休且 tombstone 仍在的完整 transfer identity 不能重新注册；
+- dispatcher 只接受第十三批 READ frame codec，不接受 version 4 SEND/RECV frame。
+
+新增 4 个 dispatcher/handshake 测试，覆盖 version 5 handshake round-trip、generation echo、交错 transfer
+路由、错误 generation/重复注册、retired terminal 重发与 sibling 隔离。完整 URMA 测试结果：
+184 passed、0 failed；`cargo fmt --all` 与 `git diff --check` 通过。
+
+下一步：增加 READ session adapter。Child 侧把 `BufferReady/SegmentOffer` 映射到
+`create_read_child/post_read_child`，按 `max_read_size` 滑动提交并等待 owner CQE；Parent 侧把
+`RegisterSource/RevokeSource` action 映射到 source owner commands。第一步使用内存 backing，Storage mmap
+lease 和生产 listener 切换继续保持关闭。

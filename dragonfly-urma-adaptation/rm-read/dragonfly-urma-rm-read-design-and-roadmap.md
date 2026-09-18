@@ -59,7 +59,7 @@ one-sided READ 的整体方案、代码改造边界、资源与故障生命周�
 
 ### 1.1 2026-09-11 设计复核补充
 
-本次补充来自文档与本地源码复核，没有新增真机验证结论：
+以下源码结论仍成立：
 
 - `[源码确认]` 当前 `udma_u_unimport_seg()` 清理本地 imported wrapper，不承担 outstanding READ drain；
 - `[源码确认]` 当前 `udma_u_ungrant_seg()` 对 `ummu_ungrant()` 失败只记录日志；外层
@@ -67,6 +67,21 @@ one-sided READ 的整体方案、代码改造边界、资源与故障生命周�
 - `[源码确认]` 当前 `MappedPiece` 只持有 mmap；`Storage::map_upload_piece()` 在 mmap 返回前就结束
   upload metadata 计数，不能直接充当 remote Segment 整个存活期的 Storage 保活凭据；
 - `[源码确认]` 当前 shared RM Jetty 创建仍绑定 JFR；READ 不消耗 bulk RECV WR 不等于可以删除 JFR 对象。
+
+### 0.2 2026-09-17 单机真实 provider 进展
+
+`[单机真机确认]` 独立 `urma-transport-lab` probe 已在 B7 的 `udmac0d1e2`、EID index 1 上完成
+双进程 RM/RTP READ 正常路径：64 MiB source 按 1 MiB 切为 64 条全部 signaled READ，64 条 send-side
+Jetty CQE 均由有效 `user_ctx` exact-once 路由和退休，完整 SHA-256、drain 前 unimport `-EBUSY`、drain 后
+Segment/Jetty unimport、source unregister/token release 和双方 shutdown 全部通过。
+
+CQE 观测为 `opcode=0`、`completion_len=0`、`is_recv=false`、`is_jetty=true`、
+`remote_id_valid=false`、`imm_data_valid=false`。因此 production owner loop 必须继续按 `user_ctx + status +
+direction + event_kind` 路由；不得用 opcode 识别 READ，也不得用 completion length 证明 READ 长度。
+
+该结果关闭 R1 的单机正常路径、CQE 路由和本地 owner/unimport 门禁，不关闭跨节点、错误权限、
+partial-post、revoke race、peer exit/flush 和 Dragonfly E2E 门禁。完整证据见
+`b7-real-provider-performance-ledger.md` 第 13 节。
 
 复核定位：
 
