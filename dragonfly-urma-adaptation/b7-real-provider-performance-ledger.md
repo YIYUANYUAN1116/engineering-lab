@@ -1242,3 +1242,119 @@ registered budget 或第二 RX Window 可用率认定为 transport-only 的首�
 5. 下一步优先从 Child 日志汇总 `digest_ns`、`pwrite_ns`、`storage_total_ns`；然后运行 pipe1/pipe2 对照，
    判断大量 optional window fallback 是否实际影响吞吐。若日志仍不足，再增加“transport + CRC、跳过
    pwrite”的中间 validation profile。
+
+### 15.6 TX allocator free-list 优化（2026-09-20，待真机 A/B）
+
+已完成 `UrmaBufferPool::acquire_tx_window_chunks()` 的源码级优化：
+
+- 删除每次申请时对全部 TX slot 的 Free 计数、slot-state 临时 `Vec` 和连续区间 `windows(W)` 搜索；
+- 删除每个选中 slot 一次的 `free_tx.retain()` 全 free-list 扫描；
+- 直接从 `free_tx` 尾部选取 W 个 slot，并在提交 reservation 前完成 kind/state、Segment 边界、generation
+  和 provider offset 校验；
+- 允许一个 Window 使用不连续的物理 registered slots。逻辑 Chunk 顺序仍由 lease spans/layouts 顺序定义，
+  每个 SEND 仍携带自己的 slot offset/length，因此不改变 wire protocol、CQE retirement 或 recycle 语义；
+- `stop()` 后的 TX 申请现在显式返回 available=0；测试构造器也只把真实 Free slot 放进 free-list。
+
+复杂度由近似 `O(T + T×W + W×F)` 降为 `O(W)`。新增测试覆盖碎片化 TX slot 仍可组成 Window，以及停止
+后的申请拒绝；URMA buffer 定向 14 项测试全部通过，storage lib 全量结果为 229 通过，另有 4 个既有
+TCP sendfile 测试因当前 sandbox 返回 `EPERM`，与本改动无关。clippy `-D warnings` 通过。
+
+当前只登记“代码路径已优化”，不登记性能收益。真机恢复后使用相同 NUMA placement、TX budget、Piece CC
+和 transport-only case 交替跑旧/新 commit，主要比较：
+
+1. `tx_required_pool_acquire_ns` 与 `tx_optional_pool_acquire_ns` 的 p50/p95/p99/max；
+2. Parent owner CPU、required retry、optional fallback；
+3. `urmaServerTransportSpanSummary` 与原 dfget E2E summary；
+4. TX128/TX160 对 pool 大小时延的敏感度是否下降。
+
+同一改动还尝试把 required TX acquire 从固定 1 ms sleep/retry 改为 recycle-generation 广播唤醒。
+`rm-rtp-piece16-cc32-010` 证明该第一版存在严重惊群：
+
+| 指标 | NUMA 绑定基线 `007` | generation 广播 `010` | 变化 |
+|---|---:|---:|---:|
+| aggregate MiB/s | 5804.87 | 6626.22 | +14.15% |
+| start→first Piece mean | 92.62 ms | 72.17 ms | -22.08% |
+| first→last Piece mean | 80.67 ms | 78.75 ms | -2.38% |
+| required pool acquire mean | 2.38 us | 1.83 us | -23.00% |
+| required attempts / retries | 3649 / 3393 | **78850 / 78594** | **21.61× / 23.16×** |
+
+010 正确性门禁全部通过且吞吐较高，但改善主要位于 startup，三样本仍有明显波动；不能把吞吐差值直接
+归因于 allocator。pool 本体下降约 0.55 us 支持 free-list 优化方向，但广播唤醒使每次 recycle 都让全部
+CC32 waiter 重提 owner command，因此 010 只登记为诊断点，不作为最终优化基线。
+
+generation 广播已经撤回，当前改为 process-wide TX slot semaphore：required Window 在异步侧按 Chunk 数
+等待 permit，取得后只提交一次 owner allocator command；optional Window 使用 `try_acquire_many`。permit
+随 command 移交 owner，只有物理 lease 创建成功才 commit；显式或 dropped lease 真正完成 free-list
+recycle 后才按回收 slot 数归还 permit。该所有权顺序覆盖 command failure、timeout/cancel 和 reply receiver
+drop，避免逻辑容量提前释放。timeout、required 优先级和 optional second-window 让行不变。新增测试覆盖
+无轮询等待、精确容量归还和 optional non-blocking failure；URMA 相关 121 项测试通过。
+
+下一轮同形态复测的首要门禁是 `required.attempts == pieceCount`、`retryCount == 0`；随后再比较
+`tx_required_acquire_ns`、owner CPU、steady Piece span 和 aggregate throughput。
+
+#### 15.6.1 Semaphore 修复复测：`rm-rtp-piece16-cc32-011`
+
+011 使用与 007/010 相同的 1 GiB、16 MiB Piece、CC32、post1、pipe2、in32 和 NUMA placement。正确性
+门禁全部通过：256 个 Parent upload、256 个 Child attempt/success，零 TCP fallback、零 transfer error、
+零 session retirement，255/256 个 Piece 复用 persistent session。
+
+| 指标 | `007` 轮询基线 | `010` generation 广播 | `011` TX slot semaphore |
+|---|---:|---:|---:|
+| aggregate MiB/s | 5804.87 | 6626.22 | **6539.70** |
+| aggregate Gbps | 48.69 | 55.58 | **54.86** |
+| first→last Piece mean | 80.67 ms | 78.75 ms | **76.16 ms** |
+| E2E mean | 176.40 ms | 154.54 ms | 156.58 ms |
+| required attempts / retries | 3649 / 3393 | 78850 / 78594 | **256 / 0** |
+| required wait mean / p95 / max | 26.35 / 71.83 / 86.02 ms | 26.09 / 66.68 / 78.22 ms | **25.52 / 34.47 / 36.89 ms** |
+| required pool acquire mean | 2.38 us | 1.83 us | **1.66 us** |
+| optional acquire mean | 42.10 us | 61.13 us | **0.56 us** |
+
+结论：
+
+1. semaphore 门禁成立：`required.attempts == pieceCount == 256` 且 `retryCount == 0`，惊群已完全消失；
+2. 相对 010 aggregate 仅低 1.31%，属于当前三样本波动范围；删除 7.8 万次重试没有造成吞吐回退；
+3. required wait mean 基本不变，证明约 25 ms 主要是真实 TX capacity 背压；p95/max 分别比 010 下降
+   48.31%/52.84%，有序 semaphore 等待显著改善尾部；
+4. optional acquire 在无 permit 时直接由异步侧拒绝，不再进入 owner，平均成本从几十微秒降至约 0.56 us；
+5. 250 个 Piece 因 required waiter 而跳过 optional Window，另 6 次 non-blocking acquire 失败，第二 TX
+   Window 本轮没有成功启用；这是 default TX budget 下的受控单 Ring 降级，不是 correctness failure；
+6. `rxBufferUnavailableLines=1` 伴随 91 次 optional RX 单 Window fallback，但全部 Piece 成功，暂记为可降级
+   pressure；若后续重复增长再检查 RX admission 与物理 RQE 一致性。
+
+011 作为 semaphore 修复后的正式基线。吞吐样本为 5805.10/7870.05/6273.11 MiB/s，稳态 Piece span 很
+集中而 startup 波动较大，因此不能仅凭本组三次样本把相对 007 的全部增益归因于 allocator/semaphore。
+
+### 15.7 TX CQ moderation 首轮 A/B（2026-09-20）
+
+在相同的 1 GiB、16 MiB Piece、CC32、post1、pipe2、in32、NUMA placement 和 semaphore allocator 代码上，
+对比 `sendCompletionInterval=16`（012）与兼容基线 `sendCompletionInterval=1`（013）。两组均执行 1 次
+warmup 和 3 次 measured repetition。
+
+| 指标 | `012` interval=16 | `013` interval=1 | 16 相对 1 |
+|---|---:|---:|---:|
+| aggregate MiB/s | **6916.66** | 6420.51 | **+7.73%** |
+| mean MiB/s | **6970.54** | 6556.49 | **+6.31%** |
+| median MiB/s | **7182.40** | 6068.66 | **+18.35%** |
+| min / max MiB/s | 6153.91 / 7575.31 | 5669.08 / 7931.74 | min +8.55%，max -4.49% |
+| start→first Piece mean | **70.05 ms** | 80.12 ms | **-12.56%** |
+| first→last Piece mean | **75.00 ms** | 76.36 ms | **-1.79%** |
+| last Piece→dfget end mean | 3.00 ms | 3.01 ms | -0.24% |
+| dfget E2E mean | **148.05 ms** | 159.49 ms | **-7.17%** |
+| required TX attempts / retries | 256 / 0 | 256 / 0 | 相同 |
+| required TX wait mean / p95 | 24.97 / 34.55 ms | 25.27 / 34.35 ms | 基本相同 |
+| required pool acquire mean | 1.99 us | **1.41 us** | 绝对值均很小 |
+| optional TX single-ring fallback | 4 | 5 | 基本相同 |
+| optional RX single-window fallback | 97 | 100 | 基本相同 |
+
+两组正确性门禁均通过：256 个 Parent upload、256 个 Child attempt/success，255 次 session reuse，且
+TCP fallback、transfer error、session retirement、busy/reject 和 required RX wait 全部为 0。TX/RX pressure
+及 required admission 基本一致，因此本轮没有看到 CQ moderation 引入容量或正确性回退。
+
+首轮结果显示 interval=16 有正向收益趋势：aggregate +7.73%，E2E mean -7.17%；但稳态 first→last Piece
+只改善 1.79%，较大差异主要来自 start→first Piece，且每组只有 3 个样本、单样本吞吐范围仍约
+1.4～1.8 GiB/s。当前结论登记为“功能门禁通过、存在收益趋势”，不能把全部差值直接归因于 CQE 减少。
+
+当前 manifest 只证明生成的 Parent/Child YAML 分别使用 interval=16 和 interval=1；运行日志尚未输出
+`send_post/send_cqe` 累计值，因此还没有运行时证据证明实际 CQE 数恰好按 16:1 收敛。下一轮应补低频累计
+统计，并交替运行 1/16（建议各至少 10 次 measured repetition）；若 Window 为 16 Chunk，再补 4/8 以观察
+收益曲线，interval 大于 16 会被 Window tail completion 截断，优先级较低。

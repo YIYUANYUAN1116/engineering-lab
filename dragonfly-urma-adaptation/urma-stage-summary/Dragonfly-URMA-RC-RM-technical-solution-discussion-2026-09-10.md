@@ -1417,9 +1417,9 @@ RX 已去除额外 staging copy，但仍有：
 
 因此 `RX registered bytes`、Window size 和 pipelineDepth 需要根据 consumer latency 调优，不能简单与 TX budget 对称配置。
 
-### 8.7 TX Window allocator 的全池扫描与 bookkeeping
+### 8.7 TX Window allocator 的全池扫描与 free-list 优化
 
-当前 TX Window allocator 不是从空闲 extent 或连续区间索引中直接取得一个 Window。每次调用 `acquire_tx_window_chunks()`，都会在 process-wide owner thread 上执行以下工作：
+优化前的 TX Window allocator 不是从空闲索引中直接取得一个 Window。每次调用 `acquire_tx_window_chunks()`，都会在 process-wide owner thread 上执行以下工作：
 
 ```mermaid
 flowchart LR
@@ -1438,7 +1438,7 @@ flowchart LR
 - 以上工作与 native resource mutation、post 和 CQ poll 共用一个 owner thread，allocator 变慢不仅延迟本 Transfer，还可能推迟其他 Peer 的 post/completion progress；
 - RX 使用 `VecDeque` 逐个 `pop_front()`，没有同样的连续 TX Window 全池搜索路径，不能把该结论笼统扩展到 RX allocator。
 
-典型 TX128 MiB、64 KiB slot 对应 `T=2048`，一个 1 MiB Window 对应 `W=16`；TX160 MiB 时 `T=2560`。已有测试中 TX160 比 TX128 慢 21.43%，扩大 registered pool 没有线性收益。当前 allocator 会随 T 增大而放大串行扫描和 `retain` bookkeeping，因此它是有源码依据的高优先级候选瓶颈。
+典型 TX128 MiB、64 KiB slot 对应 `T=2048`，一个 1 MiB Window 对应 `W=16`；TX160 MiB 时 `T=2560`。已有测试中 TX160 比 TX128 慢 21.43%，扩大 registered pool 没有线性收益。旧 allocator 会随 T 增大而放大串行扫描和 `retain` bookkeeping，因此它是有源码依据的高优先级候选瓶颈。
 
 但现有数据仍不能证明 allocator 是 TX160 下降或 134 Gbps 上限的唯一根因，cleanup、page cache/writeback、NUMA 和 source fill 仍可能共同影响结果。代码已经分别记录：
 
@@ -1447,7 +1447,37 @@ flowchart LR
 - `tx_required_pool_acquire_ns` / `tx_optional_pool_acquire_ns`：lease 内记录的 allocator 本体时间；
 - required/optional acquire attempts：用于区分 allocator 成本和 pool pressure/retry。
 
-因此 registered memory 优化应以“同时活跃的 Window working set”为依据，而不是越大越好。下一步应在严格 cleanup、交替 TX128/TX160 的相同 workload 下，对比 required/optional acquire 与 pool-acquire 的 p50/p95/p99；若确认 allocator 占比显著，再把 TX 空闲结构改为 free extent/区间索引，使正常分配接近 `O(W)` 或 `O(log E + W)`，而不是先扩大注册池。
+2026-09-20 已把 TX allocator 改为直接从既有 `free_tx` 索引栈取得 W 个 slot：不再扫描/复制全部
+slot state，不再要求物理 slot 连续，也不再为每个 slot 执行 `free_tx.retain()`。分配前先以 `O(W)`
+校验候选 slot 的 kind/state、Segment 边界、generation 和 provider offset；所有可能失败的检查完成后才
+从 free-list 提交 reservation，`LeaseBook::issue()` 失败仍沿用原 release 回滚路径。
+
+```mermaid
+flowchart LR
+    A["申请 W 个 TX slots"] --> B["检查 free_tx.len()"]
+    B --> C["读取 free-list 尾部 W 个索引"]
+    C --> D["O(W) 预校验 layout / generation"]
+    D --> E["truncate free-list<br/>提交 reservation"]
+    E --> F["生成 spans/layouts/LeaseBook 记录"]
+```
+
+因此正常 allocator 路径由近似 `O(T + T×W + W×F)` 收敛为 `O(W)`，并消除了“空闲总数足够但没有
+连续区间”造成的伪 `BufferUnavailable`。该结论是源码复杂度与单元测试结论，不等于已经证明 E2E
+吞吐提升；仍需在严格 cleanup、固定 NUMA、交替旧版/新版的相同 workload 下，对比
+`tx_required_pool_acquire_ns` / `tx_optional_pool_acquire_ns` 的 p50/p95/p99 及 transport span。registered
+memory 预算仍应以 Window working set 为依据，而不是越大越好。
+
+同轮还删除了 required TX Window 的固定 1 ms 轮询。第一版改为广播 recycle generation，但
+`rm-rtp-piece16-cc32-010` 的 256 个 Piece 产生 78850 次 required attempts / 78594 次 retry，证明每次
+recycle 唤醒全部 waiter 会造成严重惊群；该方案已撤回，不能作为最终设计。
+
+当前改为与物理 TX slot 数一致的 process-wide Tokio semaphore：required Window 先按 Chunk 数异步取得
+W 个 permit，拿到后才向 owner 提交唯一一次 allocator command；optional Window 使用 non-blocking
+`try_acquire_many`。permit 随 command 移交 owner，物理 lease 创建成功后才 commit；命令发送失败或
+allocator 失败自动归还。owner 只有在显式或 dropped lease 已真正回到 free-list 后，才按实际回收 slot
+数补回 permit。因此 timeout/cancel、reply receiver drop 和 dropped-lease 异步 recycle 都不会让逻辑容量
+早于物理容量释放。原 transfer timeout、required waiter 计数和 optional Window 让行策略保持不变。
+修复后每个成功 Piece 的 required attempts 理论上应为 1；实际吞吐和 owner CPU 收益仍待真机复测。
 
 ### 8.8 RM 当前第一阻塞不是 Dragonfly 性能
 
