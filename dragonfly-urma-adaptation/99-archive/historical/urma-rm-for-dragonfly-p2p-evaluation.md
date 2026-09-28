@@ -1,5 +1,7 @@
 # URMA RM 是否更适合 Dragonfly P2P：连接模型与演进评估
 
+> 历史文档（2026-09-28 归档）：早期 RM evaluation 已由 [RC/RM 架构主文档](../../02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md) 覆盖。原技术内容保留，按原文日期阅读。
+
 更新时间：2026-09-04。
 
 ## 0. 文档目的与当前结论
@@ -294,9 +296,9 @@ CPU 或 tail-latency 收益，才考虑改变默认模式。单 peer 不退化�
 建议首先阅读：
 
 1. 本文；
-2. `phase-b-performance-data-path.md`；
-3. `rdma-urma-upload-download-path-comparison.md`；
-4. `real-provider-validation-runbook.md`；
+2. [phase-b-performance-data-path.md](../../03-implementation/phase-b-performance-data-path.md)；
+3. [rdma-urma-upload-download-path-comparison.md](../../01-background/rdma-urma-upload-download-path-comparison.md)；
+4. [real-provider-validation-runbook.md](../../04-performance/history/real-provider-validation-runbook.md)；
 5. UMDK `doc/en/urma/URMA User Guide.md` 的 transport modes/data plane；
 6. UMDK `src/urma/lib/urma/core/include/{urma_api.h,urma_types.h}`；
 7. 当前 `dragonfly-client-storage/src/urma/{runtime,lane,completion,session}.rs` 和 `ffi/shim.c`；
@@ -309,4 +311,3 @@ CPU 或 tail-latency 收益，才考虑改变默认模式。单 peer 不退化�
 - `[架构判断]`：RM 更适合高 fan-out 资源模型，但尚未用 Dragonfly RM backend 验证；
 - `[待验证]`：RM provider 性能、共享 RX matching、peer-local retirement、公平性、故障和 shutdown；
 - 服务器恢复前不得把 RM 标记为 production-ready，也不得将裸 RM perftest 外推为 Dragonfly E2E。
-

@@ -187,8 +187,8 @@ URMA 侧核心概念与 Mooncake 适配对象的对应关系（与 verbs 类比�
 
 ## 11. 数据操作与传输模式：Mooncake vs Dragonfly 方案对比
 
-> 参照文档：`dragonfly-urma-adaptation/rm-read/dragonfly-urma-rm-read-design-and-roadmap.md`、
-> `dragonfly-urma-adaptation/urma-stage-summary/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md`。
+> 参照文档：`dragonfly-urma-adaptation/02-architecture/dragonfly-urma-rm-read-design-and-roadmap.md`、
+> `dragonfly-urma-adaptation/02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md`。
 
 ### 11.1 Mooncake 的选择（源码确认）
 

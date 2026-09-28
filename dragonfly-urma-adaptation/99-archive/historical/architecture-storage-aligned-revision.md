@@ -1,5 +1,7 @@
 # 架构修订：URMA 作为 Dragonfly Storage 内部传输后端
 
+> 历史文档（2026-09-28 归档）：阶段性 Storage 后端修订的当前架构入口为 [RC/RM 架构主文档](../../02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md)；本文的日期性代码状态保留供追溯。原技术内容保留，按原文日期阅读。
+
 > 决策日期：2026-08-25  
 > 最近更新：2026-08-30  
 > 状态：Accepted  
@@ -75,7 +77,7 @@ optional second-window non-blocking 退化和预算压力指标。
 当前仍保持 Dragonfly 边界优先：demo 只验证 UMDK/URMA native 行为；同一 persistent Session 顺序处理
 Piece，不因 B6 引入同 lane Piece 并发。B5/B6 只有静态检查，feature-on 编译受本机缺少 `protoc`/Perl
 阻断，真实 provider correctness/性能统一进入 B7。最新逐项状态以
-`phase-b-performance-data-path.md` 和 `real-provider-validation-runbook.md` 为准。
+[phase-b-performance-data-path.md](../../03-implementation/phase-b-performance-data-path.md) 和 [real-provider-validation-runbook.md](../../04-performance/history/real-provider-validation-runbook.md) 为准。
 
 2026-08-30 correctness review 补齐 shared-JFC retirement：shim 同时把 Jetty 和其 owned shared JFR
 置为 ERROR；completion DTO 暴露 `local_id` 并区分普通 WR、suspend-done、flush-done。owner 在普通
@@ -154,7 +156,7 @@ lane 并发 Piece，再在该边界增加 session id 和调度，不改变 Fabri
 2026-08-26 Session production contract 已进一步收敛：peer Error 保留 code/message；全部 control
 read/write 有显式 timeout；request/metadata 使用 owned 返回；server 可以 `reject_piece`；协商的
 inflight 不得超过本地 Jetty 对应 send/recv depth。完整的 RDMA/URMA production path 对照和滚动
-进度见 `rdma-urma-upload-download-path-comparison.md`。
+进度见 [rdma-urma-upload-download-path-comparison.md](../../01-background/rdma-urma-upload-download-path-comparison.md)。
 
 验证：
 

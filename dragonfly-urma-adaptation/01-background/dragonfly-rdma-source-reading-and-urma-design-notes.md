@@ -1,5 +1,7 @@
 # Dragonfly RDMA 源码阅读与 URMA 映射笔记
 
+> 早期源码阅读与设计笔记。文末 Phase A 建议是当时的规划；后续 RC 实现状态见 [Phase A](../99-archive/historical/phase-a-minimal-piece-over-urma.md)、[Phase B](../03-implementation/phase-b-performance-data-path.md)，RM READ 状态见 [状态页](../03-implementation/rm-read/status.md)。
+
 > 本文整理自当前对话，重点记录 Dragonfly RDMA 候选分支的数据路径、并发资源模型、Buffer 生命周期、Parent/Child 传输时序，以及对 URMA Lane / Session 设计和性能测试的启发。
 >
 > **证据说明**

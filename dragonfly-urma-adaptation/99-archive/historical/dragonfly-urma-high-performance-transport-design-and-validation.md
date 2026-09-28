@@ -1,5 +1,9 @@
 # Dragonfly × URMA 高性能 P2P 数据传输适配方案与阶段验证材料
 
+> 历史文档（2026-09-28 归档）：跨阶段汇报材料的架构以 [RC/RM 主文档](../../02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md) 和 [RM READ 主文档](../../02-architecture/dragonfly-urma-rm-read-design-and-roadmap.md) 为准；性能以 [真实 Provider 主台账](../../04-performance/history/real-provider-performance-ledger.md) 为准。原技术内容保留，按原文日期阅读。
+
+> 跨阶段汇报快照。本文关于 RM READ “跨节点未验证”等状态反映成文时点；后续双机结果和未决问题以 [RM READ 状态页](../../03-implementation/rm-read/status.md)为准。性能数字的原始依据见 [真实 Provider 实验档案](../../04-performance/history/real-provider-performance-ledger.md)。
+
 ## 1. 项目背景
 
 Dragonfly 是面向云原生场景的大规模 P2P 文件和镜像分发系统，传统 Peer 间 Piece 数据传输主要依赖 TCP 通道。在高带宽互联场景下，单 TCP 流难以充分利用底层高速网络能力，因此需要探索基于 URMA 的高性能数据传输路径。

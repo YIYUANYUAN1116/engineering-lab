@@ -1,5 +1,7 @@
 # 架构决策：Dragonfly 长期骨架与 URMA demo 复用边界
 
+> 历史文档（2026-09-28 归档）：早期独立 transport crate 决策已由 [RC/RM 架构主文档](../../02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md) 覆盖。原技术内容保留，按原文日期阅读。
+
 > 决策日期：2026-08-25  
 > 状态：Superseded（2026-08-25 storage-aligned revision）  
 > 适用范围：阶段 A 及后续多 Piece、多 peer、8 节点演进

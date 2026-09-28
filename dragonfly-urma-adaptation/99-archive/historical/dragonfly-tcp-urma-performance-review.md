@@ -1,5 +1,9 @@
 # Dragonfly TCP / URMA 性能对比
 
+> 历史文档（2026-09-28 归档）：阶段性性能汇报的数字与限制以 [真实 Provider 主台账](../../04-performance/history/real-provider-performance-ledger.md) 为准；[1 GiB 专题对比](../../04-performance/history/dragonfly-tcp-urma-1g-e2e-performance-comparison.md)保留适用条件。原技术内容保留，按原文日期阅读。
+
+> 阶段性汇报版。数字与适用条件见 [1 GiB E2E 专项对比](../../04-performance/history/dragonfly-tcp-urma-1g-e2e-performance-comparison.md)和 [真实 Provider 原始实验档案](../../04-performance/history/real-provider-performance-ledger.md)。此页不单独维护最新性能基线。
+
 ## 1. 测试说明
 
 本轮测试主要评估 Dragonfly 在当前环境下使用 URMA 替代 TCP 进行 Peer-to-Peer 数据传输后的性能收益。

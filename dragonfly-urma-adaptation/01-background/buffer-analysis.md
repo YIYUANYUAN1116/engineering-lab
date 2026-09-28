@@ -1,3 +1,7 @@
+# URMA 注册内存与 Buffer Pool 取舍
+
+> 阶段性分析；配置与实现状态以 [Phase B 性能数据路径](../03-implementation/phase-b-performance-data-path.md)及后续实验为准。
+
 没必要把 URMA slot pool 直接改造成 RDMA best-fit buffer pool。应该对齐的是生产能力和资源语义，不是内部数据结构。
 当前更合理的方向是保留 URMA 预注册 Segment，同时补齐 RDMA 已具备的预算、公平性和可观测能力。
 

@@ -1,5 +1,8 @@
 # Phase B：URMA production 性能数据路径
 
+> 阶段实施记录：本文的“当前实施状态”按原文日期阅读。当前 RC/RM 架构以 [RC/RM 主文档](../02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md) 为准，真实 Provider 性能与勘误以 [真实 Provider 主台账](../04-performance/history/real-provider-performance-ledger.md) 为准。
+
+
 更新时间：2026-09-04。
 
 > 2026-09-04 状态覆盖：B1-B6 的 production data path 已由后续真实 provider 正常路径持续验证；
@@ -31,7 +34,7 @@ B5 已接入 linked SEND/RECV post-list、partial-post 前缀记账和现有 CQ 
 WR 已全部退休且 flush-done 已到达才删除 Jetty/JFR。2026-08-31 已完成 B5/B6 单 parent、单 child、
 单 lane 的真实 provider 参数矩阵：修复 benchmark output 跨文件系统 copy 后，当前最优
 `post8-in64` 达到 2410.47 MiB/s；完整口径、六组参数和作废数据见
-[B7 真实 Provider 性能验证台账](./b7-real-provider-performance-ledger.md)。该结果不覆盖多 peer、budget
+[真实 Provider 真实 Provider 性能验证台账](../04-performance/history/real-provider-performance-ledger.md)。该结果不覆盖多 peer、budget
 pressure、公平性、fault 或 outstanding shutdown，因此 B1-B6 仍不整体标记为真机 PASS。
 
 ### B1：registered window lease 基础已落地
@@ -544,7 +547,7 @@ B6 当时的协议边界不包含“同一 lane 并发多个 Piece”；该限�
 
 2026-08-31 完成的固定 topology 1 GiB 单 lane 参数矩阵中，当时最佳结果为
 `post8-in64 = 2410.47 MiB/s`；后续 B8、`pwritev` 和多 lane 结果已显著超过该值，参见
-[B7 真实 Provider 性能验证台账](./b7-real-provider-performance-ledger.md)。这只覆盖下列顺序中的
+[真实 Provider 真实 Provider 性能验证台账](../04-performance/history/real-provider-performance-ledger.md)。这只覆盖下列顺序中的
 连续正常路径和单流性能观测，不替代尚未执行的 fault、资源压力和多 peer 项。
 
 ### B8：同 lane 并发 Piece 与 native window concurrency

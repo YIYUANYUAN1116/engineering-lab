@@ -1,5 +1,9 @@
 # Dragonfly × URMA RM 研究阶段总结
 
+> 历史文档（2026-09-28 归档）：早期 RM research 状态已由 [RC/RM 架构主文档](../../02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md) 覆盖；真机性能证据以 [真实 Provider 主台账](../../04-performance/history/real-provider-performance-ledger.md) 为准。原技术内容保留，按原文日期阅读。
+
+> 2026-09 的 RM SEND/RECV 研究阶段快照。文中“尚无真机”等状态仅代表当时；后续 RM READ 的实现和实验以 [RM READ 状态页](../../03-implementation/rm-read/status.md)与 [真实 Provider 状态索引](../../04-performance/history/real-provider-performance-ledger.md)为准。
+
 更新时间：2026-09-07
 
 > 研究目标：评估 URMA Reliable Message（RM）是否比当前 URMA RC persistent-lane 模型更适合 Dragonfly P2P。
@@ -1867,12 +1871,12 @@ provider/profile 差异
 
 本总结主要基于以下已有研究材料继续整理：
 
-- `urma-rm-for-dragonfly-p2p-evaluation.md`
+- [urma-rm-for-dragonfly-p2p-evaluation.md](./urma-rm-for-dragonfly-p2p-evaluation.md)
 - `urma-perftest-analysis.md`
-- `phase-b-performance-data-path.md`
-- `rdma-urma-upload-download-path-comparison.md`
-- `real-provider-validation-runbook.md`
-- `dragonfly-rdma-source-reading-and-urma-design-notes.md`
+- [phase-b-performance-data-path.md](../../03-implementation/phase-b-performance-data-path.md)
+- [rdma-urma-upload-download-path-comparison.md](../../01-background/rdma-urma-upload-download-path-comparison.md)
+- [real-provider-validation-runbook.md](../../04-performance/history/real-provider-validation-runbook.md)
+- [dragonfly-rdma-source-reading-and-urma-design-notes.md](../../01-background/dragonfly-rdma-source-reading-and-urma-design-notes.md)
 - UMDK/openEuler URMA API Guide、User Guide、Release Notes
 - UMDK 官方 `urma_sample`
 - 当前 Dragonfly URMA RC implementation / Phase A/B 研究结果

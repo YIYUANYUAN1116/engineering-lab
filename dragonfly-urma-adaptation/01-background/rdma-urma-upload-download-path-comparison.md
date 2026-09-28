@@ -95,7 +95,7 @@ shared overflow、动态 arena/size class 和严格跨 peer slot fairness；只�
 
 优先先做 batching、调 slot size、TX/RX shared overflow 和多 size-class；完整动态 best-fit pool 是最后
 选项。详细决策与触发条件见
-[Phase B production 性能数据路径](./phase-b-performance-data-path.md#31-urma-slot-pool-是否对齐-rdma-buffer-pool)。
+[Phase B production 性能数据路径](../03-implementation/phase-b-performance-data-path.md#31-urma-slot-pool-是否对齐-rdma-buffer-pool)。
 
 ## 3. 上传路径
 

@@ -1,5 +1,7 @@
 # A0：transport core 机械迁移状态
 
+> 历史文档（2026-09-28 归档）：A0 阶段快照已由 [RC/RM 架构主文档](../../02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md) 与 [Phase B 实施记录](../../03-implementation/phase-b-performance-data-path.md) 覆盖。原技术内容保留，按原文日期阅读。
+
 > 日期：2026-08-25  
 > 状态：历史记录；源码已迁入 storage module  
 > Dragonfly client：`urma-p2p` / `1ccc7d1`  
@@ -235,5 +237,5 @@ feature-on 当前有较多 `dead_code` warning，因为 native core 已迁入，
 ## 7. 后续状态
 
 A1 已在不修改上述机械迁移文件的前提下增加 owner thread 骨架，详见
-`phase-a-a1-engine-owner-status.md`。下一批是 A2 persistent PeerLane，不修改 `piece.rs`、Storage
+[phase-a-a1-engine-owner-status.md](./phase-a-a1-engine-owner-status.md)。下一批是 A2 persistent PeerLane，不修改 `piece.rs`、Storage
 或 dfdaemon main。

@@ -1,4 +1,33 @@
-# B7 真实 Provider 性能验证台账
+# 真实 Provider 性能验证台账
+
+> 本文是 RC、RM 与 RM READ 真实 Provider 性能数据的唯一主台账。前置导航更新至 2026-09-28；原逐轮记录和后续勘误保留在下方。引用数字须同时注明模式、拓扑、workload 和 run ID。
+
+B7 是早期 Phase B 真实 Provider 验证的阶段名称，相关原始记录和章节保留在本文中；后续 RC、RM 与 RM READ 数据继续按模式和日期登记。
+
+## 按问题找证据
+
+| 问题 | 正文位置 | 阅读提醒 |
+|---|---|---|
+| RC 初始单 lane 与并发 lane | 第 1～12 节 | 第 3 节记录已作废的跨文件系统 output-copy 数据；不要引用为有效基线。 |
+| RC 单任务 TCP/URMA 对比 | 第 11～12 节 | 只在所列双机、1 GiB、16 MiB Piece 等条件下引用；详见[专项对比](./dragonfly-tcp-urma-1g-e2e-performance-comparison.md)。 |
+| RM/RTP READ 单机 probe | 第 13 节 | 证明该 probe 的正常路径与生命周期；不能代替跨节点 READ 或故障/撤权验证。 |
+| RM/RTP 与 RC Piece CC 对照 | 第 14 节 | 是单机指定配置的趋势，原始 manifest/样本分布尚不完整，不能推断 RM 全面优于 RC。 |
+| RM transport-only 与 CRC32+pwrite 分层 | 第 15 节 | 正常路径比 transport-only 慢；现有数据不能把差值单独归因于 CRC32 或 pwrite。 |
+| selective completion / CQ moderation | 第 15.7 节，尤其 15.7.1 | **旧 1/16 性能差异不能作为 CQ moderation 收益引用**：运行时实际 interval=1，旧 post1 快速路径也未传递 complete_enable。需按 15.7.1 的配置、进程和 CQE 计数门禁复测。 |
+
+## 可引用的 RC 阶段结果
+
+- 在档案记录的双机环境下，1 GiB 单任务、16 MiB Piece、正常 CRC+写入路径，URMA CC16 为 7570.72 MiB/s，约 135 ms；TCP CC16 约 401 ms。见[专项对比](./dragonfly-tcp-urma-1g-e2e-performance-comparison.md)及正文第 11～12 节。
+- 一个 Parent 面向同一物理 Child host 上 8 个独立 daemon/Peer 的 fan-out，L8、每 lane CC8、TX128 MiB 的两次纯 URMA PASS 均值为 16003.86 MiB/s，整批 8 GiB 约 512 ms。这不是 8 个物理 Child 节点的扩展结果，也不是单个任务的 64 ms 完成时间。
+- 真实 Provider 的正常路径验证不覆盖完整故障、outstanding shutdown、跨物理 Child 扩展或 READ 与 SEND/RECV 的严格同条件 A/B。
+
+## 新实验记录要求
+
+每条新记录给出 run ID、代码与工具版本、Parent/Child、内核与 Provider、拓扑、Piece/CC、预算、文件系统、预热/样本、完整性与 fallback，以及完整 dfget 和各阶段耗时。先核对测试条件与运行时配置，再比较吞吐。RM READ 新实验也直接追加到本台账。
+
+---
+
+> 以下原始记录的开头摘要写于 2026-09-18；较晚记录和第 15.7.1 节勘误优先。
 
 更新时间：2026-09-18。
 
@@ -931,10 +960,10 @@ CRC32/Storage 成本分层。
 
 #### 当前相关文档
 
-- `real-provider-validation-runbook.md`：validation feature 构建命令及 transport-only/CRC 对照；
-- `phase-b-performance-data-path.md`：transport-only 分层测试计划和当前状态；
+- [real-provider-validation-runbook.md](./real-provider-validation-runbook.md)：validation feature 构建命令及 transport-only/CRC 对照；
+- [phase-b-performance-data-path.md](../../03-implementation/phase-b-performance-data-path.md)：transport-only 分层测试计划和当前状态；
 - 本台账 12.10 节：待执行的两组 tmpfs case；
-- `urma-stage-summary/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md`：
+- [Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md](../../02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md)：
   B7 适用边界及 transport-only 瓶颈定位说明。
 
 这些工程文档位于 Dragonfly 代码仓库之外，不会直接进入上游 PR。清理时不应删除已经取得的历史证据；
@@ -1358,3 +1387,111 @@ TCP fallback、transfer error、session retirement、busy/reject 和 required RX
 `send_post/send_cqe` 累计值，因此还没有运行时证据证明实际 CQE 数恰好按 16:1 收敛。下一轮应补低频累计
 统计，并交替运行 1/16（建议各至少 10 次 measured repetition）；若 Window 为 16 Chunk，再补 4/8 以观察
 收益曲线，interval 大于 16 会被 Window tail completion 截断，优先级较低。
+
+#### 15.7.1 配置生效异常复核（2026-09-21 运行，2026-09-28 登记）
+
+`rm-rtp-piece16-cc32-015-16` 用新增的 SEND completion 累计摘要复核 interval=16。测试结束时 Parent 输出：
+
+```text
+send_posted=65536 send_retired=65536 send_cqe=65536 sends_per_cqe=1.0
+```
+
+65536 恰好等于 1 GiB / 64 KiB ×（1 次 warmup + 3 次 measured repetition），说明本次运行每条 SEND 都
+产生了一条 CQE。发送 Window 本身正常：启动日志为 `piece_window_chunks=32`，单个 16 MiB Piece 为
+`tx_windows=8`、`max_window_chunks=32`，因此不能用单 Chunk Window 尾强制 completion 解释 1:1 CQE。
+
+生成目录中的 Parent/Child YAML 后续检查均显示 `sendCompletionInterval: 16`，用户也确认测试前修改了
+`/home/y30083740/dragonfly/config/dfdaemon-parent.yaml` 和 `dfdaemon-child.yaml`。但同一次 Parent 日志明确记录：
+
+```text
+send_completion_interval=1
+```
+
+因此当前直接结论是：**该次运行的 dfdaemon 实际使用 interval=1；生成/源 YAML 与进程解析值存在不一致。**
+这不是 provider 忽略 `complete_enable=0` 的证据，也不能说明 selective completion 实现无效。由于测试机
+暂不可用，无法恢复当时进程的 `/proc/<pid>/cmdline`、启动瞬间配置内容和文件 hash，具体属于配置快照时序、
+B7/二进制版本差异还是启动路径差异尚未闭环。
+
+后续源码复核又定位到一个独立缺口：`postListSize=1` 原先走单 WR 快速路径，该路径没有传入
+`PostEntry.complete_enable`，C shim 将 `complete_enable` 固定为 1。因此旧代码即使运行时正确读取
+interval=16，主测试使用的 post1 仍会退化为每条 SEND 一条 CQE。该问题已改为 post1 也统一走 list shim，
+同时保留固定栈缓冲以避免引入 per-post Vec 分配，并新增 native entry flag 转换回归测试。
+
+据此修正 15.7 的证据等级：012/013 虽然正确性门禁通过且吞吐存在差异，但既未证明 interval=16 在运行时
+生效，旧 post1 路径也没有真正应用 selective completion；其约 7.73% aggregate 差异暂按运行波动保留，
+**不得作为 CQ moderation 性能收益引用**。
+
+代码侧已在累计摘要中补充 `send_signaled`。下一次真机复测必须在同一 run 中同时保存：
+
+1. 启动前生成配置的 SHA-256、mtime 和 `sendCompletionInterval`；
+2. dfdaemon `/proc/<pid>/cmdline`，证明实际 `--config` 路径；
+3. 启动日志中的 `send_completion_interval`、`piece_window_chunks`；
+4. 退出摘要中的 `send_posted`、`send_signaled`、`send_retired`、`send_cqe` 和 `sends_per_cqe`。
+
+对于本 case，interval=16 的预期门禁约为 `send_posted=65536`、`send_signaled=4096`、
+`send_retired=65536`、`send_cqe=4096`、`sends_per_cqe=16.0`。只有这些证据一致后，才能恢复 1/16 性能 A/B。
+
+## 16. RM READ 性能优化记录（2026-09-28 汇入）
+
+> 以下完整保留原 RM READ 性能优化台账的口径、基线、待测问题和记录模板。后续真实 Provider 实验直接追加在本主台账，不再维护第二份当前数据源。
+
+建立：2026-09-28。前 50 批实现与验证记录已归档至[历史档案](../../03-implementation/rm-read/worklog-2026-09.md)；当前实现和安全约束见[状态索引](../../03-implementation/rm-read/status.md)与[设计文档](../../02-architecture/dragonfly-urma-rm-read-design-and-roadmap.md)。本台账从性能问题和可复现证据出发，不按代码提交次数编号。
+
+### 口径与门禁
+
+每次实验必须写明：run ID、Dragonfly/B7/UMDK 提交或构建标识、Parent/Child 节点及内核/uburma/ubcore/liburma、设备/EID/TP、source backing、文件系统、绑核、Piece 大小、CC、READ WR 大小、pwrite cap、预热与样本数。至少检查完整性、成功/尝试数、fallback 和 retained owner，再比较性能。
+
+分别报告完整 dfget aggregate、`toREAD`、READ→首 Piece、首末 Piece span、tail、READ envelope、pwrite envelope。单片阶段统计不相加当作批次墙钟：READ 与 pwrite、CRC 与 pwrite 均可能重叠。跨进程时间戳不可直接相减。低频埋点优先使用现有每 Piece 结束事件中的聚合字段，不增加逐 WR/逐窗口日志。
+
+比较 SEND/RECV 时使用其独立分支构建，在**相同机器、拓扑和 workload**下采集；既有单机 RTP、16 MiB/CC32 的约 7.57 GiB/s 与双机 CTP、32 MiB/CC16 READ 结果不是严格 A/B。
+
+### 冻结基线
+
+| run / 条件 | aggregate | 可解释的阶段事实 |
+|---|---:|---|
+| read-src-013，source shim 副本、绑核、32 MiB/CC16 | 3965.9 MiB/s | Parent register p50 24.42 ms；copy 3.84 ms；Child offer p50 25.99 ms。 |
+| read-src-014，direct mmap、同 case | 5391.5 MiB/s | Parent register p50 1.29 ms；copy 0；Child offer p50 2.25 ms。 |
+| read-src-016，direct mmap、双机 CTP、32 MiB/CC16 | 5766.8 MiB/s | READ envelope 69.33 ms；pwrite envelope 86.31 ms；重叠 52.43 ms；31/32 次 pwrite 在最后 CQE 前启动。 |
+| read-cc4/8/16-001，32 MiB Piece | 6028.0 / 6231.8 / 5579.0 MiB/s | 高 CC 改善 READ envelope，但写入 envelope 到 CC8 已约 80 ms；aggregate 含不同前导。 |
+| read-pwr4/8/16-001，CC16 | 5961.1 / 5554.6 / 6136.7 MiB/s | 限流改变单片等待与写入耗时分配，未显著缩短约 81–85 ms 批次 pwrite envelope。 |
+| read-batch32/8/4-001，CC16 | 5893.9 / 5399.4 / 6182.1 MiB/s | 每 Piece 1/4/8 WR，owner 批量提交成立；READ envelope 约 65–68 ms，未呈随 WR 数改善的趋势。 |
+
+以上来自不同轮次，不能跨行直接计算优化百分比。原始命令、样本和勘误见[历史档案](../../03-implementation/rm-read/worklog-2026-09.md)第四十至五十批。
+
+### 当前测量准备（2026-09-28）
+
+READ 分支工作区已增加低频字段：Child 每 Piece 的 `progress_query_count/progress_query_ns/post_command_ns/poll_sleep_ns`，以及 READ lease 的 `pwrite_start_ns/pwrite_end_ns/writeback_start_ns`（相对该 Piece Storage 阶段开始）。字段附在已有完成事件上，不增加逐 WR 或逐窗口日志。离线测试 316 passed、1 个真机测试 ignored；这些新字段尚无真机结果，现有 B7 汇总脚本尚未展示它们。代码仍在本地工作区，正式实验须记录实际提交标识。
+
+本分支的旧 SEND/RECV 函数不参与 READ bulk data；已撤销误加在该函数上的对照埋点。SEND/RECV 基线必须由其实际运行的分支另行测量。
+
+### 优化问题与下一实验
+
+#### P1：确认目标栈上的 source 注册成本
+
+- 已知：196 的 file-backed 注册近似 45.15 µs/MiB、截距约 0.006 ms；198 的 file-backed 探针有约 17.7 ms/call 固定等待。两机驱动构建不同，不能从一台外推。
+- 补证：198 同进程/同 context 交替测 file 与 anon；给 register/unregister 前后加 syscall marker，定位慢调用；记录真实模块路径、哈希、srcversion 以及 liburma 哈希。
+- 产品 A/B：若 198 式栈属于目标环境，让 198 实际担任 Parent，对比 direct file-backed 与 **exact-Piece** anonymous staging。保持 32 MiB Piece、CC16、相同绑核和注册预算；比较 copy、register、offer、READ envelope、pwrite 与完整 aggregate。
+- 判定：若 staging 的复制加匿名注册明显低于 file-backed 注册且完整下载改善，再考虑显式 `sourceBackingMode`；否则保持 direct，并调查/统一驱动栈。不得用 task 级 Segment 绕过 exact-Piece 授权。
+
+#### P2：解释 READ 与 SEND/RECV 的产品差距
+
+- 在相同双机拓扑、同一文件系统和相同 Piece/CC 上，分别用 READ 与旧 SEND/RECV 分支测正常 CRC+写入路径；固定样本数和预热。
+- READ 侧看 Parent source register/offer、Child READ 查询/post/轮询、CQE 至写入、writeback、recycle 和批次重叠；SEND/RECV 侧须采集对应窗口就绪与写入时间，不能从本 READ-only 分支的遗留函数取基线。
+- 若 READ 数据面比 SEND/RECV 慢，再单独看 provider/CTP 和 JFS occupancy；若主要是写入尾部，比较实际 Storage 写入策略；若差距集中在前导，不把它归咎于 READ opcode。
+
+#### P3：优化选择门槛
+
+当前不继续缩小 READ WR，也不因 196 数据引入 Parent source registered-slot pool。pwrite cap4/8/16 没有证明吞吐收益。任何新方案先指出要消除的**具体阶段**、预计节省的墙钟、会增加的复制/内存/授权成本，再用相同 case A/B；通过完整性和 owner 退休门禁后才讨论默认值。
+
+### 新记录模板
+
+#### YYYY-MM-DD：问题 / 假设
+
+- 版本与拓扑：
+- 唯一变量与对照 run ID：
+- workload、预热、样本、日志级别：
+- 功能门：成功/尝试、CRC、fallback、retained owner：
+- 完整 dfget 与分阶段墙钟：
+- Parent source 与 Child READ/Storage 分解：
+- 结论：证实、否定或证据不足；仅适用的栈/条件：
+- 下一步与停止条件：

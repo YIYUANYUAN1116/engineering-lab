@@ -1,8 +1,10 @@
+> 归档说明：以下是截至 2026-09-24 的逐批原始记录，保留当时的命令、数据、勘误与已被后续证据修正的判断。当前结论请先看[状态索引](./status.md)，新实验写入[性能优化台账](../../99-archive/historical/urma-rm-read-performance-optimization-ledger-2026-09-28.md)。
+
 # RM READ 离线实现进度
 
 更新时间：2026-09-17。
 
-设计入口：[RM READ 整体方案与路线图](./dragonfly-urma-rm-read-design-and-roadmap.md)。
+设计入口：[RM READ 整体方案与路线图](../../02-architecture/dragonfly-urma-rm-read-design-and-roadmap.md)。
 
 本文已从代码仓库 `docs/` 迁移到工程文档的 `rm-read/` 目录，后续以此处为唯一进度记录。
 下列源码路径和命令均相对于 Dragonfly `urma-read-prototype` 工作区根目录。
@@ -1442,7 +1444,7 @@ WARN urma_delete_context failed errno=0
   用这个已释放的 tid 去 `register_seg`；而控制组 `reg_clean` 恰好把 64 个名额用满，故 storm 轮
   **每一次**都拿到悬垂 tid
 - 另发现：reuse 轮的 `reused` tid 未释放 → `urma_delete_context` 失败（`WARN ... errno=0`）
-- 修复：[token_probe.c](../../../../dev/dragonfly-urma-tools/urma-b7/token_probe.c) 中
+- 修复：[token_probe.c](../../../../../dev/dragonfly-urma-tools/urma-b7/token_probe.c) 中
   `MAX_LIVE_TOKENS 64→128`、`probe_register_seg` 入口先 `free_live_tokens()`、失败时打印
   `first failure errno`、run 末尾释放 `reused` ⇒ **0d storm 需重跑**
 - 仍有效的一行：`0d register_seg (tid reused)` p50 0.121ms / errors=0 ⇒ **顺序复用同一 tid 合法**
@@ -2983,3 +2985,522 @@ READ envelope三组只相差约3ms，没有随每Piece WR数从1增至4、8而�
 - 不再继续测试更小READ WR；
 - 下一优化转向task级source registration/reuse：同一1GiB task应尽量只注册一次page-aligned source mapping，再为各Piece发布不同offset/length的descriptor；
 - 实现前必须先明确cache key、文件变更校验、token/generation轮换、并发Piece引用计数、最后一个引用后的revoke/unregister，以及失败时旧descriptor不可继续授权。不能仅按路径缓存native handle。
+
+
+---
+
+## 第四十七批：source registration 斜率探针、两组形态与产品侧反证（2026-09-24）
+
+第四十六批把瓶颈定位到Parent source publication/register节奏：`register` p50约1.95--2.02ms、32个Piece串行注册累计约62--65ms，与READ envelope直接闭合。由此提出两个粗化候选：B把k个连续Piece注册成一个窗口（32→4次调用），A整任务只注册一次（32→1次）。两者在准入记账上都是内存中性的——`sourceBytes`硬预算fail-closed，粒度只改变计费单位、不改变总字节。性能层面的关键未知量是`urma_register_seg`的成本按**调用**绑定还是按**字节**绑定；能否落地还必须独立满足exact-Piece bearer capability边界，见第五十批。
+
+### 1. 归因列口径钉死
+
+本轮修正一处此前混用的口径，两者不可互换：
+
+| 列 | 来源 | 计时范围 |
+|---|---|---|
+| `register` | `stage_register_ns` | 整段span：异步跨界IPC + `map_path_range` + 准入 + shim全套 |
+| `pin` | `stage_reg_seg_ns` | 只包住`shim.c` L1042的`urma_register_seg` |
+
+即direct形态下`register` 1.29ms − `pin` 1.02ms = 0.27ms才是非注册开销。此前把`register`当作`pin`引用，把「逐片注册是关键路径」的证据放大了一个量级。
+
+### 2. 工具：read_register_probe.c
+
+`urma-b7/read_register_probe.c`，本地单机设计：不需要peer、jetty、lane、端口或TCP控制协议，只需本机URMA设备。
+
+- R1长度扫：1MiB..1GiB共9档，同一后备内存，每档重复64/32/16/8/4/2次，报每调用p50/p95/max、ms/MiB与GiB/s；跑两遍（pass1/pass2）以便把页驻留/IO成本从注册成本里分离；
+- R2 head-to-head：同一1GiB、同一token id下32×32MiB vs 1×1GiB；
+- R3拟合与判定：斜率、每调用截距，以及call-bound/byte-bound在32MiB处的拆分；
+- R4 unregister扫：revoke→unregister是同一关键路径上的第二项。
+
+注册调用逐位对齐产品的direct形态（核对见第4节）。默认形态把后备**只映射一次**并在其上重复注册窗口；`--remap`补齐产品形态的差距：每次注册前fresh `mmap`窗口 + `MADV_SEQUENTIAL` + `MADV_WILLNEED`，unregister后`munmap`，并把mmap+advise单独计时（`R1 map`行）。
+
+提交：B7 `62794e9`（`update: read register`，探针本体）、B7 `8a762ca`（`update`，新增`--remap`，+86/-14）。本轮未改Dragonfly仓库，仍为`f38fbdf`。
+
+编译与运行：
+
+```bash
+cc -O2 -Wall -Wextra -I /usr/include/ub/umdk/urma read_register_probe.c \
+   -L /usr/lib64 -lurma -lurma_common -lpthread -o read_register_probe
+
+LD_LIBRARY_PATH=/usr/lib64 ./read_register_probe --device udmac0d1e2 \
+  --file /home/y30083740/dragonfly-b7/1GiB-content.bin --remap
+LD_LIBRARY_PATH=/usr/lib64 ./read_register_probe --device udmac0d1e2 \
+  --file /home/y30083740/dragonfly-b7/1GiB-content.bin
+```
+
+### 3. 198 真机数据：两种file-backed形态给出同一截距
+
+两组都在198（`computer`）上跑，`max_bytes=1024MiB`、`lengths=9`、`mode=file-backed`、`offset=distinct consecutive windows`。
+
+| L | `--remap` pass1/pass2 | long-lived pass1/pass2 | `R1 map` p50 |
+|---:|---:|---:|---:|
+| 1MiB | 17.741 / 17.865 | 17.595 / 17.617 | 0.008 |
+| 4MiB | 17.818 / 17.657 | 17.650 / 17.789 | 0.006 |
+| 8MiB | 17.709 / 17.642 | 17.674 / 17.776 | 0.006 |
+| 16MiB | 17.819 / 17.922 | 17.726 / 17.832 | 0.007 |
+| 32MiB | 18.023 / 17.915 | 17.956 / 17.900 | 0.007 |
+| 64MiB | 18.245 / 18.200 | 18.284 / 18.046 | 0.007 |
+| 128MiB | 18.546 / 17.782 | 18.507 / 18.450 | 0.006 |
+| 256MiB | 18.891 / 18.866 | 18.237 / 18.629 | 0.006 |
+| 1024MiB | 21.456 / 21.036 | 21.440 / 21.251 | 0.009 |
+
+（表内为每调用p50，单位ms。）
+
+四点可直接读出：
+
+1. **`mmap`+2×`advise`本身只有0.006--0.009ms**，全长度不变。所以`register − pin`那0.27ms里`map_path_range`最多只占约7µs，其余全在异步IPC与准入。
+2. **成本几乎与长度无关**：1MiB到256MiB只涨1.15ms，1GiB再多2.5ms。拟合给出约**17.7ms截距 + 约3µs/MiB斜率**，32MiB处99.3%是截距。
+3. **pass1≈pass2**（Δ在−0.39 ~ +0.76ms之间），所以与页驻留、首触、文件IO都无关。
+4. **unregister只要0.019--0.027ms**（1GiB为0.052~0.134ms），比register便宜50--200倍。若那17.7ms是「走过N页」的页表工作，unregister必须付同样量级——它不付。
+
+两种形态（一次常驻映射 vs 每调用fresh mmap+advise+munmap，此时VMA等于注册窗口）给出**同一截距**，这否掉了「VMA页数」解释：1MiB窗口只有256页，仍然付17.7ms。
+
+探针自身的判定：
+
+| | `--remap` | long-lived |
+|---|---|---|
+| R2 32×32MiB | 573.28ms（17.915/call） | 572.79ms（17.900/call） |
+| R2 1×1GiB | 21.04ms（21.036/call） | 21.25ms（21.251/call） |
+| R2节省 | 552.24ms（96.3%） | 551.53ms（96.3%） |
+| R3斜率 | 0.00310ms/MiB | 0.00355ms/MiB |
+| R3截距 | 17.862ms/call | 17.613ms/call |
+| R3在32MiB | call-bound 99.4% / byte-bound 0.6% | 同 |
+
+即：**在探针环境里`urma_register_seg`是per-call绑定的**，粗化在此处能省掉96.3%的注册时间。（**该判定只适用198**：196复跑后判为per-byte，见第四十八批。）
+
+### 4. 产品侧反证：这17.7ms在产品里不存在（198特例）
+
+先排除「调用方式不同」。逐位核对`shim.c`的`dfurma_read_source_register_impl`（L955--L1054）：
+
+| 项目 | 产品 | 探针 |
+|---|---|---|
+| `cfg.va` / `cfg.len` | MappedPiece VA / 片长 | mmap VA / 窗口长 |
+| `token_policy` | `URMA_TOKEN_PLAIN_TEXT` | 同 |
+| `access` | `URMA_ACCESS_READ` | 同 |
+| `cacheable` | `URMA_NON_CACHEABLE` | 同 |
+| `token_id_valid` | `URMA_TOKEN_ID_VALID` | 同 |
+| `non_pin` | 0（注释明写external pages must be pinned） | 0 |
+| 对齐 | `DFURMA_PAGE_ALIGNMENT 4096U` | 4096 |
+| context | `urma_create_context(device, eid_index)` | 同 |
+| token id | `urma_alloc_token_id`（MAPT_MODE_TABLE） | 同 |
+
+调用参数、对齐、上下文、token id全部一致，所以差异只能来自**进程/设备状态**，不能由「怎么调」解释。
+
+然后是硬证据。read-src-014/016的**warmup批次**是各自新content文件的冷注册，单片整段`register` span只有**2.03 / 1.62ms**，其中`pin`为**1.05 / 1.03ms**：
+
+> 单片**一次调用**的整段span（2.03ms）小于探针的**单次调用地板**（17.7ms）。这与并发度无关——同一次调用的耗时不可能短于该调用自身的固定成本。
+
+旁证一：R2预言的每任务source成本573ms，是整个dfget（182.80ms）的3.1倍，也超过READspan（106.25ms）。
+
+旁证二：file/anon比值。
+
+| | file-backed | anon | 比值 |
+|---|---|---|---|
+| 探针 | 1MiB 17.6ms | 1GiB 0.068ms（anon形态Set 1，该形态判定为94.4%按字节） | **约260×** |
+| 产品 | 32MiB 1.02ms（014/016 direct） | 32MiB 0.19ms（013 shim副本） | **5.4×** |
+
+方向一致（file比anon贵），但探针把file臂放大约48倍。
+
+结论：**探针自洽但不可移植。它只校准了anon臂**（探针anon的每调用小常数与产品copy臂的0.19ms同量级），file臂是它自己进程环境里的一个固定惩罚。因此R3的`PER-CALL BOUND`不能外推给产品，A/B仍未被裁决。**（本结论已被第四十八批部分推翻）**：17.7ms是198（**file-backed臂**）的形态；196复跑后，探针在196上复现产品（32MiB 1.421ms vs 产品`pin` 1.00~1.02ms）并判定per-byte。但**198单元格本身未被排除**——第四十八批§1查明文档中不存在任何198-native的注册耗时（初稿引用的`dstAdm` 0.47ms是pool命中路径、warmup冷注册2.03ms是196的parent列，两条均作废）。因此「A/B已裁决」与「探针不可移植」两个说法都应收起；正确表述是**成本模型为(节点×backing)属性，必须逐节点测**。
+
+### 5. read-src-013/014/016读数
+
+三臂同case（`read-piece32-cc16-post1-pipe2`）、32MiB Piece、CC16、`fallb=0`、`ok/att 128/128`（4批×32片）、`n=3`，只有注册路径不同：
+
+| run | 路径 | `direct` | `copy#2` | `register` | `pin` | `wait` | `revoke` | aggregate | dfget | rate |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 013 | shim副本（未直注册） | 0/0 | 3.84 | 24.42 | 0.19 | 23.13 | 1.81 | 3965.9MiB/s | 249.01ms | 9084.1MiB/s |
+| 014 | direct mmap | 96/0 | 0.00 | 1.29 | 1.02 | 5.34 | 0.65 | 5391.5MiB/s | 191.59ms | 12538.6MiB/s |
+| 016 | direct mmap | 96/0 | 0.00 | 1.38 | 1.00 | 6.00 | 0.59 | 5766.8MiB/s | 182.80ms | 12828.1MiB/s |
+
+（parent各列为samples p50，单位ms。）
+
+direct臂的`pin`（1.00/1.02ms）重复性2%、`register`（1.29/1.38ms）7%，是可用的判读基准。
+
+013↔014是一次产品内受控对照：同长度、同设备、同flag，只有backing不同。file-backed（MappedPiece直注册）`pin` 1.02ms/8192页 = 124ns/页，而shim-owned副本0.19ms = 只有每调用固定项。**direct mmap的+45%收益是在pin变贵5.4倍的前提下取得的**：收益来自消掉alloc/copy与流水线停顿，不是来自pin——013的`register`里24.42 − 3.84(copy) = 20.6ms落在IPC/准入/shim，不含alloc/copy/pin/token任何一项；同时`wait` 23.13 → 5.34ms、child `offer` 25.99 → 2.25ms。
+
+### 6. 真正瓶颈已不在注册
+
+016的dfget（182.80ms）自洽分解：
+
+| 段 | ms | 占比 |
+|---|---:|---:|
+| `toREAD` | 75.25 | 41.2% |
+| `READ->1` | 24.58 | 13.4% |
+| `piece` | 79.83 | 43.7% |
+| `tail` | 3.43 | 1.9% |
+
+四段和183.09ms ≈ 182.80ms；`1024MiB / 79.83ms = 12828MiB/s`与`rate`列完全相同，口径自洽。前导（`toREAD`+`READ->1`）99.8ms = **54.6%**，aggregate/rate = 5602/12828 = **43.7%**，效率损失全在前导。
+
+数据面内部，瓶颈已在Child写路径而不是Parent：
+
+- `pieceE2E` 42.22ms中`pwrite` **32.93ms（78%）** + crc 3.80ms；
+- 16片在飞、32片 ⇒ 2轮 × 42.2ms = 84.4ms，与`piece`相位79.83ms相差约5%；
+- 每片pwrite 32MiB/32.93ms = 995MiB/s；`peakPwr` 15 ⇒ 聚合上限约15×32MiB/32.93ms = 14925MiB/s，略高于实际交付12828MiB/s ⇒ 写路径处于高occupancy，但不是唯一硬顶；
+- `1CQE->pwr` 15.35ms、`lastCQE->end` 33.89ms（`pwrEnv` 86.31ms > `READenv` 69.33ms，overlap 52.43ms）都指向写队列排空；
+- READ本身只占2.60ms/片。对比013：`pwrite`只有22.06ms而`offer` 25.99ms，与parent侧`srcE2E` 54.5ms → 6.53/7.05ms同步收敛，说明那时Child在等Parent。
+
+判读纪律：前导是唯一的漂移项，**013↔014/016的前导拆分不可单独归因**（`toREAD` 52.31→75.25反而升、`READ->1` 80.81→24.58降），只有014↔016这一对可复现对比（78.55/75.25、25.75/24.58、81.67/79.83）。启动链中lane只在warmup建立一次（`line->lane` 85.20/88.48ms，样本批次为`reused`，`lane->piece`为负−19.5~−20.1ms，是日志时序artifact）。该表逐batch的`piece ms`与per-run的`piece`列不同源（013为80.72/80.61/82.64 vs per-run 112.72），本批不引用其数值。
+
+### 7. 当前结论与下一步
+
+1. **A/B的期望收益上限已降到个位数百分比。** direct之后`register`是1.29ms、READspan 106ms，非pin固定项只占约8%（约0.27ms × 31 ≈ 8ms/任务）；`pin`项占约31%（32 × 1.02 ≈ 32.6ms），能否被粗化省掉取决于per-call vs per-byte。
+2. **决定性实验回到产品内，且很便宜**：同case、同CC16，只换Piece length（合法范围[4MiB, 64MiB]），读`pin`。
+
+| `pin`观测 | 判定 | 对A/B的含义 |
+|---|---|---|
+| 16MiB ≈ 1.0ms且64MiB ≈ 1.0ms | per-call | 粗化可省约31ms/任务（READspan的约30%），值得做 |
+| 16MiB ≈ 0.5ms且64MiB ≈ 2.0ms | per-byte | 总页数不变，A/B ≈ 0，否决 |
+
+（**该表已被第四十八批替代**：196-as-source实测byte-bound 99.6%、粗化收益为0。但A/B作为**工程决策**仍未关闭——198的file-backed单元格待解释，见第四十八批§1/§4。本表本身不再作为待办。）
+
+产品自己已给出一条长度不变性证据：copy臂`pin`在16MiB片（read-src-005~007，既有记录）为0.18--0.20ms、在32MiB片（013）为0.19ms——**长度翻倍而pin不动**，那条臂就是per-call、截距约0.19ms。direct臂只缺16/64MiB两个点。
+
+3. **探针投资方向已被第四十八批§4末条改写**（本条原判「不再在探针上继续投资」作废）：成本模型是(节点×backing)属性，需逐节点测，先做198的anon/file两臂单会话A/B。若仍要解释那17.7ms，下面三条低成本验证仍然可用：`/usr/bin/time -v`看user+sys与wall的差（≈1135ms ⇒ 真在烧CPU；只占几十ms ⇒ 在睡，即固定等待/超时，与jitter仅±0.9ms吻合），配`strace -T -f -e ioctl,ppoll,nanosleep`；同机A/B——dfdaemon/parent在跑时与不在跑时各跑一次探针，若掉到约1ms即设备状态依赖；比较`/proc/<pid>/limits`的Locked Memory与dfdaemon单元的`LimitMEMLOCK`，memlock受限会给出一个与长度无关的每调用惩罚，正好符合观测形态。
+4. **优化优先级修正**：对1GiB这个文件规模，前导约占55%、数据面占44%，数据面已到Child写路径量级。继续压`register`/`pin`的上限收益被前导封顶；前导与Child写路径是下一阶段主战场，粗化注册只有在第2项判为per-call时才回到桌面。
+
+
+---
+
+## 第四十八批：196复核推翻第四十七批，196-as-source注册判定per-byte（2026-09-24）
+
+> **2026-09-24更正**：本批初稿把判定外推为「全网per-byte、A/B关闭」。该外推不成立——198也可能承担source角色，只是当前case把它当child。§1/§3/§4已按「(节点×backing)单元格」重新限定：**A/B在196-as-source上收益为0，但作为工程决策仍待定。**
+
+第四十七批的结论建立在198（`computer`）的探针数据上：判为per-call、每调用17.7ms固定项，并据此认为「探针不可移植、A/B待裁决」。本批回到196（`controller`）复跑同一条探针命令，**196-as-source单元格**的结论被推翻：196不是per-call，探针在196上复现产品，判定为per-byte。**198单元格的形态未被本批排除**（见§1）。
+
+### 1. 方法学更正：198的异常尚未被排除，且无198-native证据
+
+第四十六批以来的source registration讨论针对的是Parent侧，而**本case中**196才是`parent`/`origin`/`scheduler`所在节点（198只有`child`）。第四十七批把探针放在198上跑，量的是child节点的注册行为，不是本case中产品实际付钱的那一侧。
+
+**但「198只当child、所以198的形态无害」是拓扑假设，不是机制结论**：任何节点都可能承担parent角色（部署无法选择哪台机器当parent），而探针量的正是产品source路径的调用形态（file-backed、eid 0、同flag）。因此198的17.7ms必须被解释或证伪，不能按「无害」处理。
+
+**当前不存在任何198-native的`urma_register_seg`证据。** 本批初稿引用过两条，均已作废：
+
+| 初稿引用 | 真实出处 | 作废原因 |
+|---|---|---|
+| `dstAdm` 0.47ms | 第四十一批§3的`destination admission 0.48ms` | 同批§1写明`destination sample 96/0/0`**全部pool hit**——这96个样本里没有发生任何`urma_register_seg`，测的是pool命中路径，与注册耗时无关 |
+| warmup冷注册2.03/1.62ms | 同批`register`列（parent-side p50） | 那是**196**的产品数；拿196的产品数比198的探针数属跨机比较，正是第四十七批刚纠正过的选主机错误 |
+
+child的destination注册是pool惰性增长、发生在warmup，被p50列排除，所以**文档中不存在任何198上报出的注册耗时**。「198的17.7ms在产品里不存在」这句话目前**零证据支撑**。
+
+### 2. 196真机数据
+
+命令与第四十七批相同，仅换机器与文件：
+
+```bash
+LD_LIBRARY_PATH=/usr/lib64 ./read_register_probe --device udmac0d1e2 \
+  --file /home/y30083740/dragonfly-b7/origin/input-1g.bin --remap
+```
+
+| L | pass1 p50 | pass1 first | pass2 p50 | Δ(p1−p2) | `R1 map` p50 | unreg p50 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1MiB | 2.525 | 2.607 | 0.051 | +2.475 | 0.020 | 0.022 |
+| 4MiB | 9.867 | 0.522 | 0.179 | +9.687 | 0.019 | 0.045 |
+| 8MiB | 19.043 | 0.661 | 0.352 | +18.691 | 0.018 | 0.081 |
+| 16MiB | 38.722 | 1.262 | 0.707 | +38.015 | 0.020 | 0.154 |
+| 32MiB | 2.793 | 2.170 | 1.421 | +1.373 | 0.004 | 0.296 |
+| 64MiB | 2.920 | 3.883 | 2.839 | +0.081 | 0.004 | 0.588 |
+| 128MiB | 5.751 | 6.849 | 5.762 | −0.011 | 0.004 | 1.159 |
+| 256MiB | 11.486 | 12.862 | 11.589 | −0.103 | 0.005 | 2.330 |
+| 1024MiB | 46.711 | 46.711 | 46.241 | +0.470 | 0.006 | 9.609 |
+
+（单次调用p50，单位ms。）
+
+读点：
+
+1. **pass2严格线性、截距≈0**：各档ms/MiB为0.0510/0.0448/0.0440/0.0442/0.0444/0.0444/0.0450/0.0453/0.0452，斜率**45.1µs/MiB（≈22.2GiB/s）**，截距**0.006ms**。
+2. **pass1的冷页成本是真实的**：4/8/16MiB档为2.38~2.47ms/MiB（≈408MiB/s，每4KiB页约2.4µs的冷读）。
+3. **`first`与p50分离是「先热后冷」的指纹**：4MiB档`first`只有0.522ms而p50为9.867ms——1MiB档的64 reps已把前64MiB读进来，4MiB档首窗落在已驻留区；到32MiB档整个1GiB文件已驻留，pass1≈pass2。
+4. **unreg也是per-byte**：斜率9.34µs/MiB（≈107GiB/s）、截距约0.013ms，比register便宜约4.8倍。
+5. `mmap`+2×`advise`在196上更便宜：0.004~0.020ms。
+
+### 3. 判定：196-as-source为PER-BYTE（结论限此单元格）
+
+```
+R2 32x32MiB = 45.46ms (1.421ms/call)  vs  1x1GiB = 46.24ms (46.241ms/call)  -> saving = -0.78ms (-1.7%)
+R3 slope = 0.04515ms/MiB  intercept = 0.006ms/call
+R3 32MiB: call-bound 0.4%  byte-bound 99.6%  (measured p50 = 1.421ms)
+```
+
+32片×32MiB与1片×1GiB注册的是同样多的字节，实测前者反而略快0.78ms（1.7%，噪声量级）⇒ **在196上粗化收益为0**。
+
+与产品闭合：
+
+| | ms/MiB | 32MiB | 每1GiB task |
+|---|---:|---:|---:|
+| 探针 @196 pass2 | 44.4µs/MiB | 1.421ms | 45.5ms |
+| 产品 014/016 `pin` | 31.3~31.9µs/MiB | 1.00~1.02ms | 32.6ms |
+
+同量级（探针慢约1.4×）。产品的content文件是parent刚写过的热页，所以产品付的是纯注册项、不含冷页成本。
+
+两台机器的形态对比：
+
+| 单元格 | 斜率 | 截距 | unreg形态 |
+|---|---:|---:|---|
+| 196 × file-backed | 45.1µs/MiB | 0.006ms | per-byte，9.3µs/MiB |
+| 198 × file-backed | 3.10µs/MiB | 17.7ms | 长度无关，0.019~0.027ms |
+| 198 × anon | 第四十七批Set 1：1GiB 0.068ms，94.4%按字节 | —— | —— |
+
+斜率差15×、截距差约3000×、unreg形态完全不同⇒是两套行为，不是同一机制的快慢之别。
+
+**判别项看起来是backing，不是节点**：198自己的anon臂（Set 1，1GiB仅0.068ms）是便宜的，贵的只有198的file-backed臂；而196的file-backed臂是便宜的。产品source路径恰好**就是file-backed**（`MappedPiece`直注册），所以「198当parent」正是唯一没有产品证据、且风险最高的组合。Set 1与Set 2来自不同会话，因此这个判别项还需一次单会话A/B确认（见§4末条）。
+
+### 4. 结论
+
+1. **A/B在「196-as-source」这一单元格上收益为0，但作为工程决策仍待定**：在196上每1GiB task约32.6ms（产品）的source注册是**按字节的固定税**，占READspan 106.25ms的约31%，粗化不减总字节（R2 saving −0.78ms），粒度在196上不可动；第四十六批「转向task级source registration」的动机在196上消失，此前为它准备的内存可控性论证在196上不再需要。
+   **但这不能外推**：成本模型是(节点×backing)属性，而部署无法选择哪台机器当parent。只要存在一个per-call形态的节点（198的file-backed臂就是唯一候选），它当parent时注册成本会从32.6ms/1GiB变成约573ms/1GiB——5.4× READspan、3.1× 整个dfget，B在那里省96.3%。所以正确的记法是：**A/B = 196上无收益 / 其他单元格未知**，直到§4末条的最小闭环做完。
+2. **残余杠杆只剩两条**，都需新论证：
+   - **跨任务复用注册**（同一task文件被重复下载时不重新注册）：4批次可省3/4，但常驻1GiB正好等于整个`sourceBytes`池，会把并发任务串行化，并重新引入token/generation轮换与文件变更校验的正确性负担；
+   - **提高扫描速率本身**：22GiB/s是196的速率常数，但198的3.1µs/MiB说明它并非硬件常量。要验证页大小是否为杠杆，需一次新实验——同长度、不同背衬页大小（THP / hugetlbfs / DAX）比µs/MiB。45.1µs/MiB折成每4KiB页约176ns，可能与页粒度工作同量级；仅凭当前斜率既不能证明，也不能排除页表项相关成本。
+3. **性能优化目标回到第四十七批§6已定位的两处**：前导（占dfget 54.6%）与child `pwrite`（占pieceE2E 78%）。**但其优先级排在198单元格之后**——后者决定「某些节点能否承担parent角色」，是结论正确性问题，不是性能问题。
+4. **探针不可退役**：它已给出两个互斥单元格，而成本模型是**(节点×backing)属性，必须逐节点（且分anon/file两臂）测**，不能用一台机器的结论代表全网。「跑在付该项成本的那一侧」只解决了本case的选机问题，不解决跨节点差异。
+   下一轮最小闭环：**同一支二进制在198（`computer`）与196（`controller`）上各跑一次file臂，198再补anon臂**，用`strace`同时记录`mmap/madvise/munmap/ioctl/openat/close`。命令如下（**file臂已执行，结果见第四十九批；anon臂未跑**）：
+
+   ```bash
+   # 198（computer）
+   strace -f -ttT -yy \
+      -e trace=mmap,madvise,munmap,ioctl,openat,close \
+      -o /tmp/reg-computer.strace \
+      env LD_LIBRARY_PATH=/usr/lib64 \
+      ./read_register_probe \
+      --device udmac0d1e2 \
+      --file /home/y30083740/dragonfly-b7/1GiB-content.bin \
+      --remap
+
+   # 196（controller）
+   strace -f -ttT -yy \
+      -e trace=mmap,madvise,munmap,ioctl,openat,close \
+      -o /tmp/reg-controller.strace \
+      env LD_LIBRARY_PATH=/usr/lib64 \
+      ./read_register_probe \
+      --device udmac0d1e2 \
+      --file /home/y30083740/dragonfly-b7/origin/input-1g.bin \
+      --remap
+   ```
+
+   判读分支（待数据）：
+   - anon便宜 + file 17.7ms ⇒ 判别项是**file-backed在198**，且不是Set 1/Set 2的会话漂移；
+   - 两臂都17.7ms ⇒ 判别项是**节点/驱动**，与backing无关。
+
+   若落到前者，再做环境diff：`uname -r`、UM驱动/`lsmod`、`lspci -nn`（`udmac0d1e2`在196/198是两张卡）、`transparent_hugepage/enabled`、进程`MemLock`、探针是否与dfdaemon并发跑。
+
+---
+
+## 第四十九批：17.7ms定位到单次ioctl，且两机uburma/ubcore不同构（2026-09-24）
+
+第四十八批把问题留成「198的file-backed单元格待解释」。本批用两条`strace`（命令已记在第四十八批§4，均为`--remap`的**file臂**，未跑anon臂）与两机环境基线，把该单元格推进两步：**① 17.5/17.7ms坐落在一次具体的ioctl上；② 两机跑的不是同一份uburma/ubcore，所以"196是基准、198是异常"这个前提本身不成立。**
+
+本轮无代码改动。两条日志的限制必须先声明：
+
+- 两机都只取了`grep ioctl | head -50`，只覆盖bring-up与前6~8个稳态周期；
+- `mmap/madvise/munmap`虽在`-e trace=`里，但被`grep ioctl`滤掉，所以**慢调用落在register还是unregister未定**；
+- 两条`sha256sum`因`**`未开`globstar`而静默失败（见§4）。
+
+### 1. 两日志逐行同构，分歧只有一处
+
+设备集合、fd号、命令码、顺序完全一致。`<...>`的单位是**秒**，故`<0.008456>`=8.456ms、`<0.000112>`=112µs。
+
+| 位置 | 196 `controller` | 198 `computer` | 比值 |
+|---|---:|---:|---:|
+| 枚举：`fd8`上7个`/dev/uburma`节点×2轮 | ~55µs/次 | ~55µs/次 | 1× |
+| `fd7` bufC：`_IOC(READ\|WRITE,0x55,0x1,0x10)` | 0.052ms | 0.051ms | 1× |
+| `fd7` bufD：同命令码 | 8.248ms | 8.361ms | 1.0× |
+| `fd5</dev/ummu/tid>` `_IOC(WRITE,0x6b,0x4,0x80)` | 7.993ms | 8.456ms | 1.06× |
+| `fd7` bufE：`0x55/1` | 0.013ms | 0.011ms | 1× |
+| **稳态·每周期 `fd7` bufF：`0x55/1`（固定指针）** | **0.108–0.144ms** | **17.174–18.687ms** | **~156×** |
+| 稳态·每周期 `fd7` bufG：`0x55/1` | 21–29µs | 20–38µs | 1× |
+| 稳态·每周期 `fd5</dev/ummu/tid>` `_IOC(WRITE,0x6b,0x6,0x80)` | 11–12µs | 12–18µs | 1× |
+| 稳态周期 | ~0.27ms | ~17.75ms | ~66× |
+
+读点：
+
+1. **198的每周期慢调用：中位17.47ms、抖动±4%**（17.174/17.675/17.425/17.469/18.687/17.174/17.884/17.453）；196同一条为 0.108/0.115/0.111×5/0.144 ⇒ **中位112µs**。比值 **~156×**。
+2. **退出码0（成功）且抖动只有±4%** ⇒ 是有界等待（锁/flush/失效完成一类），不是CPU烧算，也不是重试。
+3. **同fd、同命令码的另外两次调用两机一致**（20µs量级）⇒ 排除「198的uburma路径整体慢」。
+4. **bring-up那对8.25/7.99ms在两机完全相同** ⇒ 上下文/TID创建是一次性固定项，node无关，也不是198的17.7ms来源。
+5. 周期差（17.75 − 0.27 ≈ 17.48ms）几乎等于单次慢调用差（17.47 − 0.11 ≈ 17.36ms），自洽。
+6. readdir顺序两机不同（198起于`udmac1d1e3`，196起于`bonding_dev_0`），但同一机两轮顺序相同 ⇒ 只是目录读取顺序，无语义。
+7. `/dev/ummu/tid`在两机上都是`char 10:261`；`/dev/uburma/*`是508:0–6 vs 509:0–6（整体差1）。
+
+### 2. 两机驱动/内核不同构
+
+`strace`只能给到形参，环境基线给出了更硬的差异：
+
+| 项 | 196 `controller` | 198 `computer` |
+|---|---|---|
+| 内核 | **`6.6.0-hugepage-3`**（自定义localversion） | `6.6.0-145.3.27.158.20260826.b7db8e91096e.oe2403sp3.aarch64`（发行版） |
+| uburma模块 | `.../urma/uburma/uburma.ko`（**未压缩**） | `.../urma/uburma/uburma.ko.xz`（压缩） |
+| uburma签名 | **无**`sig_id`/`sig_key`/`signature` | **有**，签于`openEuler kernel ICA 1` |
+| uburma `srcversion` | `5F882FB8E46EDCC686CBE5B` | `BF53BB9308B95A03F8F554F` |
+| ubcore `srcversion` | `5371A5ECA36E634C5B8962B` | `AD35AA93AADA372ACFFAB3C` |
+| uburma参数面 | **多一个`static_devnum`**（"Use a static major and stable per-device minor numbers"） | 无此参数 |
+| ubcore参数面 | 6项 | 6项（同集） |
+| `intree` | Y | Y |
+
+两点推断：
+
+- `srcversion`两边都不同 ⇒ 至少**构建上下文不同**；
+- `module_param`通常不受config门控，196独有`static_devnum` ⇒ 更指向**源码级差异**。196还是未压缩、未签名的`.ko`，即**非发行版RPM构建**（本机自建）。
+
+合起来：**196与198的uburma/ubcore不是同一份驱动**。§1里`/dev/uburma` major差1（508 vs 509）与196独有`static_devnum`可能同源，但**未证**（需要该参数的当前值，见§4）。
+
+### 3. 收回「同命令码=同操作」
+
+上一轮据§1断言「同一个fd、同一个命令码 ⇒ 同一操作」。**该断言作废**：既然两边驱动源码不同，`_IOC(READ|WRITE,0x55,0x1,0x10)`这个**数字上相同**的命令在两机**未必是同一个handler**；同一命令码在196上就已出现4种不同耗时（52µs/8.25ms/13µs/0.112ms）与4个不同buffer，本身就说明载荷决定语义。
+
+因此§1可用的表述只有一条：**「两机syscall序列逐行同构，其中第F个调用198=17.47ms vs 196=112µs」**——这是形参级事实；「这条命令慢156×」成立，「这条命令在两机上是同一个操作」不成立。
+
+要坐实语义需要：驱动源码（两个`srcversion`对应的树）或`strace -x`/`-s`解出16B载荷。
+
+### 4. A/B判定升级为(内核+驱动构建 × backing)，待补四项
+
+**"谁是基准"现在反了：** 196是自建内核（名字带`hugepage`）+自建驱动，未必是产品要跑的那套；198是发行版签名栈，更像产品目标环境。此前把196当"真相"、198当"异常"，**可能是反的**。
+
+| 产品目标栈 | source注册形态 | A/B的含义 |
+|---|---|---|
+| 196式（自建/`hugepage-3`） | per-byte（45.1µs/MiB、截距0.006ms） | 粗化收益≈0 |
+| 198式（发行版签名） | per-call（截距17.7ms、byte-bound 0.6%） | 注册耗时账面可省约96%，但当前exact-Piece授权模型不能直接粗化 |
+
+所以**粗化的性能收益不是固定的，而是部署哪套内核+驱动的函数**；能否实现仍由exact-Piece授权边界独立决定；第四十八批的「196-as-source」应改称「**196栈-as-source**」，成本模型的实际形状是**(内核+驱动构建 × backing)**。
+
+**待补四项**（前三项是命令，第四项是项目问题）：
+
+```bash
+# 1) 196上该参数的当前值（196独有此参数，且major差1）
+cat /sys/module/uburma/parameters/static_devnum
+
+# 2) .ko哈希与srcversion：直接使用modinfo返回的真实路径
+for module in uburma ubcore; do
+  path=$(modinfo -n "$module")
+  printf '%s %s\n' "$module" "$path"
+  sha256sum "$path"
+  modinfo -F srcversion "$module"
+done
+
+# 3) 用户态库：记录realpath、文件哈希和包版本，两边都要取
+for library in /usr/lib64/liburma.so* /usr/lib64/liburma_common.so*; do
+  realpath "$library"
+  sha256sum "$library"
+done
+rpm -qf /usr/lib64/liburma.so* /usr/lib64/liburma_common.so* 2>/dev/null | sort -u
+```
+
+4. **产品要跑的到底是哪套栈**（196式还是198式，或第三套）。这条不答，A/B判不了。
+
+**另外两条限制与线索：**
+
+- **慢调用落在register还是unregister仍未定**。198的R4 unregister是长度无关的19–27µs，与周期内那次~20µs的`fd7`调用吻合，**暗示周期 = register + unregister + 一次ummu**，但这是暗示不是证据。用现成文件即可判定：`grep -n -e ioctl -e mmap -e madvise -e munmap /tmp/reg-computer.strace | sed -n '1,60p'`（慢调用落在`mmap…munmap`之间即register carrier），以及`awk`统计`>5ms`的调用总数是否等于`档数×reps`。
+- **196内核名带`hugepage`**：第四十八批把「页大小是否为杠杆」列为残余杠杆②，这个名字给了一条线索；但`hugepage`也可能只是localversion字符串，**属线索非结论**。
+
+
+---
+
+## 第五十批：设计复核——取消通用粗粒度注册，改为栈画像下的exact-Piece backing选择（2026-09-24）
+
+第四十七至四十九批对设计有实质影响。性能事实仍成立：196式栈的file-backed注册近似per-byte，198式发行版栈的file-backed注册存在约17.7ms per-call固定等待；但这不能直接推出task级或多Piece Segment。
+
+### 1. 单位更正
+
+R3输出单位是`ms/MiB`。因此：
+
+- 196斜率`0.04515ms/MiB` = **45.15µs/MiB**，约22.2GiB/s；
+- 198斜率`0.00310ms/MiB` = **3.10µs/MiB**；
+- 196 unregister斜率`0.00934ms/MiB` = **9.34µs/MiB**；
+- 45.1µs/MiB折算约176ns/4KiB页，不是0.18ns/页，原“低于一个时钟周期、所以不是页表项”的推论删除。
+
+单位错误不改变拟合比例、R2 head-to-head结果和per-call/per-byte分类，但会改变对底层机制的描述。
+
+### 2. 粗粒度注册与现有安全模型冲突
+
+当前生产路径明确维持exact-Piece能力边界：
+
+- `ReadSourceMemory::Mapped`持有Piece-exact mmap；
+- `ReadSegmentOffer`携带原生descriptor/token；token是bearer capability；
+- Child native创建强制`descriptor.length == piece_length`；
+- Child READ的`remote_offset`从该descriptor基址的0开始，并只在Piece长度内推进；
+- Parent只在该Piece的ReadDone/CancelDrained与provider revoke proof后撤权和释放backing。
+
+把多个Piece或整个task注册成一个Segment，会把原生descriptor/token的硬件可读范围扩大到整个窗口。即使wire只告诉Child某个Piece offset，持有bearer token的对端仍可能绕过Dragonfly状态机直接向窗口内其他offset发READ。软件generation、digest和本地bounds check不能缩小已发出的硬件能力。
+
+因此第四十六批提出的“task级source registration/reuse”**不再作为通用生产优化实现**。只有provider能提供并经R1/R5证明的“同一底层注册上派生Piece-exact、peer/transfer-bound子能力”时，才可重新评估；当前URMA descriptor/token接口没有这项已证明能力。
+
+### 3. 新的产品方案：保持exact-Piece，按栈选择source backing
+
+两类栈应使用不同的Piece-exact source backing策略：
+
+| 栈画像 | 候选路径 | 原因 |
+|---|---|---|
+| 196式，file-backed约1ms/32MiB且per-byte | direct `MappedPiece` | 已消除copy，粗化不减少总注册工作 |
+| 198式，file-backed约17.7ms/call而anon很便宜 | exact-Piece staging | 复制32MiB到shim-owned匿名对齐内存，再注册同一个Piece；授权范围不扩大 |
+
+这不是根据单次线上延迟自动切换。建议新增显式配置/已验证profile，例如`sourceBackingMode: direct|staging`；`auto`只有在B7/provider preflight已固化内核、uburma/ubcore、liburma哈希及两种backing结果后才能启用。未知栈继续用安全默认值并记录诊断，不以性能探针失败改变生命周期语义。
+
+旧`read-src-013`不能直接证明198上的staging收益：它运行在196作为Parent的拓扑，而且混入了旧版owner/IPC流水线开销。决定性产品A/B应交换角色让198承担Parent，在当前`f38fbdf`代码上只切换source backing：
+
+1. direct `MappedPiece`；
+2. exact-Piece anonymous staging；
+3. 固定32MiB Piece、CC16、32MiB READ WR和相同绑核；
+4. 比较Parent `register/pin/copy#2/wait/sourceE2E`、Child `offer`、READ envelope和完整aggregate；
+5. 两臂必须保持descriptor.length等于Piece长度、每Piece独立token/generation/revoke。
+
+若staging能把198 Parent的每 Piece source路径从约17.7ms降到“copy + anon register”的低个位数毫秒，它是当前安全模型内的可落地优化；若不能，则应优先统一或修复目标驱动栈，而不是扩大Segment授权范围。
+
+### 4. 第四十九批还需收紧的证据
+
+- R4的unregister p50约20--30µs，与稳态bufG耗时吻合；R1 register约17.7ms，与bufF吻合，所以“bufF承载register”已有很强对应关系，但现有截断日志还不是调用级证明。最小补证是在探针register/unregister前后写可被`strace -e write,ioctl,...`捕获的marker，而不是仅依赖通用ioctl的16B头。
+- 当前探针的file和anon是两个独立进程/会话；文档要求的“单会话A/B”尚未被工具支持。若要排除会话漂移，应新增一个进程内、同context/token id、file/anon交替运行的模式。
+- 模块哈希应使用`modinfo -n uburma`与`modinfo -n ubcore`返回的真实路径，避免`**`未启用导致静默漏采；用户态库同时记录realpath、SHA-256和包版本。
+- `static_devnum`与major差异只影响设备编号的可能性较高，当前没有证据把它连接到17.7ms register等待；不要把它列为性能根因候选，除非驱动源码或trace建立调用链。
+
+### 5. 路线调整
+
+1. 保留32MiB READ WR和owner batch-post；多WR测试已否定继续缩小WR。
+2. 保留现有exact-Piece Segment/token/revoke模型；暂停task级、多Piece窗口注册实现。
+3. 先补198同会话file/anon与register marker，确认栈画像；同时明确生产目标内核/驱动版本。
+4. 若198式栈属于目标环境，下一项Dragonfly代码应是**可配置的exact-Piece staging A/B**，随后由真机数据决定profile默认值。
+5. pwrite仍是数据面排空项，但cap4/8/16已证明简单并发限流不提高吞吐；在source backing A/B完成前不再调整pwrite路径。
+
+---
+
+## 附录：2026-09-28 原状态页快照
+
+以下保留 2026-09-28 原状态页的完整内容；当前简短状态见 [status.md](./status.md)。
+
+# Dragonfly URMA RM READ：当前状态与文档索引
+
+更新时间：2026-09-28。本页是当前入口；逐批实现、真机原始结果和曾被后续证据修正的判断，完整保存在[实现与验证历史档案](./worklog-2026-09.md)。新的实验与优化决策记录在[性能优化台账](../../99-archive/historical/urma-rm-read-performance-optimization-ledger-2026-09-28.md)。协议、安全边界与长期路线见[设计文档](../../02-architecture/dragonfly-urma-rm-read-design-and-roadmap.md)。
+
+## 当前实现
+
+- `urma-read-prototype` 是 RM + READ bulk data 分支；TCP 承担控制面。本分支不以 SEND/RECV 作为生产 bulk data 路径。
+- Child 使用每 Piece 的 registered destination lease，完成 READ CQE、terminal gate 后交给 Storage，并在消费完成后回收。destination pool 已在样本中验证命中。
+- Parent 对每个 Piece 导出 exact-Piece Segment/token；page-aligned Storage 映射可直接注册，映射保留至安全撤权。异常结果保留 owner 和预算，不能把控制超时、TCP EOF 或普通 unregister 返回值单独当作撤权证明。
+- 32 MiB Piece 当前默认一条 32 MiB READ WR；owner 命令可批量提交同一 Piece 的多条 WR，但 native shim 仍逐条 post，CQE 仍逐 WR 确认。
+- 双机 CTP 正常路径、CRC/写入、内容校验、128/128 Piece 成功且 fallback 0 已有真机结果；这不等于所有失败/撤权竞态和部署栈组合均已验证。
+
+## 已成立的性能结论
+
+| 证据 | 结论及边界 |
+|---|---|
+| read-src-013 → 014，同轮绑核、相同 case | direct mmap source 使 aggregate 从 3965.9 增至 5391.5 MiB/s；Parent source register p50 从 24.42 降至 1.29 ms。该对照只支持本次 source 路径优化。 |
+| read-src-016，双机 CTP、32 MiB Piece、CC16 | aggregate 5766.8 MiB/s；首 READ 至最后 Piece 的 rate 12828.1 MiB/s。READ CQE p50 约 2.60 ms/片，pwrite p50 约 32.93 ms/片；批次 READ envelope 约 69.33 ms，pwrite envelope 约 86.31 ms，二者重叠约 52.43 ms。 |
+| CC4/8/16、pwrite cap4/8/16、32/8/4 MiB WR 对照 | CC8 在该轮 aggregate 最好；单纯限制 pwrite 并发没有缩短批次写入尾部；多 WR 虽完成批量 owner 提交，也没有系统性缩短 READ envelope。不要仅按 aggregate 排序选择 WR 粒度，前导波动较大。 |
+| 196-as-source 的 file-backed 注册探针 | 32×32 MiB 和 1×1 GiB 注册时间约 45.46/46.24 ms，近似按字节计费，粗化未带来收益；产品 direct 注册约 1 ms/32 MiB。此结论只适用于该栈和 backing。 |
+| 198 的 file-backed 探针 | 约 17.7 ms/次固定等待，和 196 的行为不同；198 作为 Parent 的产品路径及单会话 file/anon 对照尚未闭环。不能据此将整个 task 注册成一个 Segment。 |
+
+历史单机 RTP SEND/RECV 与上述双机 CTP READ 的 Piece 大小、CC、写入形态和拓扑不同。现有数据**不能证明 READ 在同条件下快于或慢于 SEND/RECV**；需要独立分支在相同工作负载做 A/B。
+
+## 当前决定与未决问题
+
+1. 保持 exact-Piece Segment、独立 token/generation 与撤权边界；暂停 task 级或多 Piece 注册。扩大 native descriptor 范围会扩大远端 bearer capability，软件 offset 检查无法收窄授权。
+2. 196 式栈继续以 direct file-backed mapping 为基线。198 式栈若属于目标部署，优先验证 exact-Piece 匿名 staging 是否能以一次 32 MiB 复制换掉昂贵的 file-backed 注册。尚未据探针数据决定默认值。
+3. 确认产品目标的内核、uburma/ubcore、liburma 构建与 backing 行为；同一设备名不能代替栈画像。
+4. 用新的低频时间字段区分 READ owner 查询/post/轮询、source register/offer、READ 完成、Storage pwrite/CRC/writeback/回收。先测量，再选择下一项代码优化。性能实验须区分完整 dfget、Piece 稳态斜率和 transport-only，不能混用。
+5. 对照 SEND/RECV 时应保持机器、拓扑、Piece/CC、文件系统、CPU 绑定、预热与样本数一致；SEND/RECV 基线来自另一分支，本 READ 分支不运行那条数据面。
+
+## 记录规则
+
+- 本页只更新当前状态、已成立结论和指向台账的链接，不再逐批追加过程。
+- 新实验写入[性能优化台账](../../99-archive/historical/urma-rm-read-performance-optimization-ledger-2026-09-28.md)，每条记录注明代码提交、节点角色、栈画像、workload、完整性结果、耗时分解和下一步判定。
+- 旧实验的命令、表格、勘误与被修正的推论仍可在[历史档案](./worklog-2026-09.md)按“第 N 批”追溯；阅读较早章节时以较晚勘误和本页结论为准。

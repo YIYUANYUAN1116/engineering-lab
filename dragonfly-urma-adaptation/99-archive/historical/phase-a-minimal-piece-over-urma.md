@@ -1,5 +1,7 @@
 # 阶段 A：最小 Dragonfly Piece over URMA 闭环实施分析
 
+> 历史文档（2026-09-28 归档）：Phase A 阶段方案已由 [RC/RM 架构主文档](../../02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md) 和 [Phase B 实施记录](../../03-implementation/phase-b-performance-data-path.md) 覆盖。原技术内容保留，按原文日期阅读。
+
 >历史阶段文档：当前实现已在 Phase B/B8 演进到单 persistent lane 多 Piece 原生并发，最新状态见 B7 台账。
 
 > 分析日期：2026-08-25  
@@ -657,7 +659,7 @@ error 处理，不与正常 retirement 混用。
 read/write 全部有显式 timeout；request/metadata 改为 owned 返回；server 增加 `reject_piece`；
 negotiated inflight 不能超过本地 Jetty send/recv depth。Storage、discovery、全局 buffer admission、
 limiter、metrics 和 fallback 仍明确留在 client/server/dfdaemon adapter。上传下载逐段对照和后续
-滚动进度见 `rdma-urma-upload-download-path-comparison.md`。
+滚动进度见 [rdma-urma-upload-download-path-comparison.md](../../01-background/rdma-urma-upload-download-path-comparison.md)。
 
 交付门槛：mock/feature-on 生命周期测试；重复启动/失败回滚；无 lane shutdown；有 outstanding
 WR 的 drain/timeout 路径可诊断。

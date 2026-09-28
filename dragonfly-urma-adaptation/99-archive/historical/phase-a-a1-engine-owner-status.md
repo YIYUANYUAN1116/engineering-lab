@@ -1,5 +1,7 @@
 # A1：UrmaEngine owner thread 骨架状态
 
+> 历史文档（2026-09-28 归档）：A1 阶段快照已由 [RC/RM 架构主文档](../../02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md) 与 [Phase B 实施记录](../../03-implementation/phase-b-performance-data-path.md) 覆盖。原技术内容保留，按原文日期阅读。
+
 > 日期：2026-08-25  
 > 状态：历史记录；Engine 已收敛为 storage-private UrmaFabric
 

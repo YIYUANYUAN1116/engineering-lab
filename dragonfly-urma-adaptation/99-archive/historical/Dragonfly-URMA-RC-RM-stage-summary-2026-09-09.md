@@ -1,5 +1,7 @@
 # Dragonfly × URMA RC / RM 阶段总结
 
+> 历史文档（2026-09-09 阶段总结，2026-09-28 归档）：当前 RC/RM 架构由 [RC/RM 主文档](../../02-architecture/Dragonfly-URMA-RC-RM-technical-solution-discussion-2026-09-10.md) 覆盖；真实 Provider 数字以 [真实 Provider 主台账](../../04-performance/history/real-provider-performance-ledger.md) 为准。原技术内容保留，按原文日期阅读。
+
 **当前 RC 架构、数据路径、B7 性能口径与 RM 资源模型梳理**
 
 日期：2026-09-09

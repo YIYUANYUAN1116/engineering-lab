@@ -23,9 +23,9 @@ one-sided READ 的整体方案、代码改造边界、资源与故障生命周�
 
 开始设计前已完整阅读：
 
-- `rdma-urma-upload-download-path-comparison.md`；
-- `b7-real-provider-performance-ledger.md`；
-- `urma-rm-for-dragonfly-p2p-evaluation.md`。
+- [rdma-urma-upload-download-path-comparison.md](../01-background/rdma-urma-upload-download-path-comparison.md)；
+- [real-provider-performance-ledger.md](../04-performance/history/real-provider-performance-ledger.md)；
+- [urma-rm-for-dragonfly-p2p-evaluation.md](../99-archive/historical/urma-rm-for-dragonfly-p2p-evaluation.md)。
 
 并对照了：
 
@@ -81,7 +81,7 @@ direction + event_kind` 路由；不得用 opcode 识别 READ，也不得用 com
 
 该结果关闭 R1 的单机正常路径、CQE 路由和本地 owner/unimport 门禁，不关闭跨节点、错误权限、
 partial-post、revoke race、peer exit/flush 和 Dragonfly E2E 门禁。完整证据见
-`b7-real-provider-performance-ledger.md` 第 13 节。
+[real-provider-performance-ledger.md](../04-performance/history/real-provider-performance-ledger.md) 第 13 节。
 
 复核定位：
 
@@ -396,6 +396,8 @@ MappedPiece owner
 - page alignment、offset alignment、pin/non-pin 和 cache coherency 以目标 provider 实验为准。
 
 建议一个 Piece 一个最小授权 Segment，而不是给 peer 暴露整个 task 文件或整个 storage。
+
+性能 profile 可以在两种**仍然保持 exact-Piece**的source backing间选择：直接注册`MappedPiece`，或先复制到shim-owned匿名对齐staging再注册。选择依据必须是目标内核、uburma/ubcore与liburma组合上归档的file/anon注册结果；不能通过扩大到多Piece/task Segment来规避per-call成本。未知栈不自动切换，且两种路径都必须保持每Piece独立descriptor/token/generation/revoke。
 
 需引入明确的 `ExportedPieceLease` owner，同时持有：
 
@@ -874,6 +876,7 @@ RTP/CTP 分别登记支持或不支持，只放行通过 gate 的 profile。当�
 
 - 将现有 `MappedPiece` 扩展为可被owner thread安全注册的backing owner；
 - Parent exact-Piece read-only Segment；
+- 在不扩大授权范围的前提下支持profile选择direct file-backed或anonymous staging source；
 - Child lease接入现有registered Storage finish；
 - Piece、persistent Piece和persistent-cache Piece；
 - mmap/register失败、BUSY和中途READ失败的整Piece TCP fallback；
@@ -907,8 +910,8 @@ RTP/CTP 分别登记支持或不支持，只放行通过 gate 的 profile。当�
 
 ```text
 RM SEND/RECV baseline
-RM READ from registered staging buffer
-RM READ from file mmap
+RM READ from exact-Piece registered staging buffer
+RM READ from exact-Piece file mmap
 TCP baseline
 ```
 

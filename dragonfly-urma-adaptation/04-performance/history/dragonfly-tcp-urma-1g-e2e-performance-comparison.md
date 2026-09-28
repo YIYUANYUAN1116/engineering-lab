@@ -1,5 +1,7 @@
 # Dragonfly TCP vs URMA 1 GiB E2E 下载性能对比
 
+> RC SEND/RECV 在指定双机环境下的性能快照。原始 run 与后续勘误见 [真实 Provider 原始实验档案](./real-provider-performance-ledger.md)；RM READ 的最新状态见 [RM READ 状态页](../../03-implementation/rm-read/status.md)。
+
 更新时间：2026-09-08
 
 ## 1. 文档说明
